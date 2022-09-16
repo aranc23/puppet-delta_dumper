@@ -9,7 +9,6 @@
     * [Beginning with delta_dumper](#beginning-with-delta_dumper)
 1. [Usage - Configuration options and additional functionality](#usage)
 1. [Limitations - OS compatibility, etc.](#limitations)
-1. [Development - Guide for contributing to the module](#development)
 
 ## Description
 
@@ -61,3 +60,5 @@ class { 'delta_dumper':
 No attempt is made to install all the requirements for the
 delta-dumper perl script.
 
+Notably, although delta-dumper supports various compression programs
+this module doesn't attempt to install bzip2, zstd, etc.

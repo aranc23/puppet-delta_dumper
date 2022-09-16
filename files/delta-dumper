@@ -1,0 +1,1227 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+use v5.16;
+
+# might be assumed to be installed on any perl system by default?
+use Data::Dumper;
+use English qw( -no_match_vars );
+use File::Basename;
+use POSIX;
+use Fcntl qw(:DEFAULT :flock); # import LOCK_* constants
+use File::Temp qw/ tempfile /;
+use Env qw( HOME HOSTNAME );
+use Pod::Usage;
+eval { use Time::HiRes qw( time ); };
+use File::Spec;
+use Date::Parse;
+
+# added from CPAN or system packages
+use Log::Dispatch;
+use Log::Dispatch::Syslog;
+use Log::Dispatch::Screen;
+use Log::Dispatch::File;
+use AppConfig qw(:expand :argcount);
+use Getopt::Long qw(:config pass_through) ; # use this to pull out the config file, then let AppConfig handle the rest
+
+##### GLOBALS ##### # the horrror:
+# use this string when refering to ourself:
+my $APP_NAME = 'delta-dumper';
+
+# tease the user out of the environment, or just call getpwuid:
+my $USER
+    = $ENV{LOGNAME} || $ENV{USERNAME} || $ENV{USER} || scalar( getpwuid($<) );
+
+# define what programs to use for what compression setting:
+my %compressors = (
+    'gzip' => {
+        'compress'   => 'gzip -c --rsyncable',
+        'uncompress' => 'gzip -c -d',
+        'extension'  => 'gz',
+    },
+    'bzip2' => {
+        'compress'   => 'bzip2',
+        'uncompress' => 'bzcat',
+        'extension'  => 'bz2'
+    },
+    'xz' => {
+        'compress'   => 'xz -T0 --stdout',
+        'uncompress' => 'xzcat -T0',
+        'extension'  => 'xz'
+    },
+    'zstd' => {
+        'compress'   => 'zstd -T0 --stdout',
+        'uncompress' => 'zstd -T0 --uncompress --stdout',
+        'extension'  => 'zst',
+    },
+);
+
+# global app configuration
+my $config;
+
+# the path to the config file to be parsed
+my $CONFIG_FILE
+    = $USER eq 'root'
+    ? File::Spec->catfile( '/etc', $APP_NAME, 'config' )
+    : File::Spec->catfile( $HOME, '.config', $APP_NAME, 'config' );
+
+# unused, unloved, restore mode!
+my $RESTORE=0;
+
+# create the call back for the dispatcher at the top level (probably
+# not needed)
+my $callback_clean = sub { my %t=@_;
+                           chomp $t{message};
+                           return $t{message}."\n"; # add a newline
+                         };
+
+# global dispatcher variable for use in dlog() etc.
+my $DISPATCHER;
+
+# keeping track of run time
+my $RUNTIME;
+
+# just ensure hostname is set to something
+unless($HOSTNAME and length $HOSTNAME > 0) {
+  $HOSTNAME=`hostname`;
+  chomp $HOSTNAME;
+}
+
+######## MAIN ########
+
+main();
+
+######## SUBROUTINES ########
+sub lock_file_compose {
+  return sprintf('%s/%s.lock',$config->backup_location,$_[0]);
+}
+sub lock_pid_file {
+  my $MAXWAIT=30;
+  my $LOCK_FILE=lock_file_compose(@_);
+  my $LOCK;
+  my $waittime=time();
+  my $locked=0;
+
+  unless(open($LOCK,'+<',$LOCK_FILE) or open($LOCK,'>',$LOCK_FILE)) {
+    return 0;                   # false or fail
+  }
+  eval {
+    local $SIG{ALRM} = sub { die "alarm\n" }; # NB: \n required
+    alarm $MAXWAIT;
+    if (flock($LOCK,LOCK_EX)) {
+      $locked=1;
+    }
+    alarm 0;
+  };
+  if ($@) {
+    die unless $@ eq "alarm\n"; # propagate unexpected errors
+  } else {
+    if ($locked) {
+      truncate($LOCK,0); # this shouldn't fail if we have the file opened and locked!
+      print $LOCK $$."\n";      # who really cares if this fails?
+      return $LOCK;             # happiness is a locked file
+    }
+  }
+  # this is the fall through for the cases where we have received an alarm
+  # or we failed to lock the file without receiving a signal
+  close $LOCK;
+  return 0;
+}
+sub unlock_pid_file {
+  flock($_[0],LOCK_UN);
+  close $_[0];
+}
+
+# create the dispatcher and return it
+sub create_dispatcher {
+  my $disp=Log::Dispatch->new( callbacks => $callback_clean );
+
+  if ($config->sys_logging) {
+    $disp->add(Log::Dispatch::Syslog->new(name      => 'syslog',
+                                          min_level => $config->level,
+                                          ident     => $APP_NAME.'['.$$.']',
+                                          facility  => $config->facility,
+                                          socket    => 'unix',
+                                         )
+              );
+  }
+  if ($config->terminal_logging) {
+    $disp->add(Log::Dispatch::Screen->new(name      => 'screen',
+                                          min_level => $config->log_level,
+                                          stderr    => 1,
+                                         )
+              );
+  }
+  if ($config->file_logging) {
+    $disp->add(
+               Log::Dispatch::File->new(
+                                        name      => 'logfile',
+                                        min_level => $config->level,
+                                        filename  => File::Spec->catfile($config->log_location,"${APP_NAME}.log-".strftime('%Y%m%d',localtime(time()))),
+                                        mode      => '>>',
+                                       )
+              );
+  }
+  return $disp;
+}
+
+sub stringy {
+  # each element passed to stringy should be a HASH REF
+  my %a; # strings
+  foreach my $h (@_) {
+    next unless ref $h eq 'HASH';
+    foreach my $key (keys(%$h)) {
+      next if ref ${$h}{$key}; # must not be a reference
+      my $val=${$h}{$key};
+      $val =~ s/\n/NL/g; # remove newlines
+      $val =~ s/"/\\"/g; # replace " with \"
+      if ($key =~ /password/) {
+        $val = 'XXXXXXXX';
+      }
+      if($key eq 'tag' or $key eq 'host') {
+        $a{"${APP_NAME}_${key}"}=$val;
+      } else {
+        $a{$key}=$val;
+      }
+    }
+  }
+  my @f;
+  foreach my $key (sort {&sort_tags} (keys(%a))) {
+    push(@f,"$key=\"$a{$key}\"");
+  }
+  return join(" ",@f);
+}
+
+# main logging function, using global dispatcher
+sub dlog {
+  my $level = shift;
+  my $msg   = shift;
+  my $time  = time();
+  my $str   = stringy({'msg'      => $msg,
+                       'severity' => $level,
+                       timestamp  => $time,
+                       datetime   => strftime("%FT%T%z",localtime($time))},
+                       hostname => $HOSTNAME,
+                      @_);
+  $DISPATCHER->log( level   => $level,
+                    message => $str,
+                  );
+  return $str;
+}
+
+sub sort_tags {
+  return tag_prio($a) <=> tag_prio($b);
+}
+
+sub tag_prio {
+  my %prios=(
+             datetime  => -10,
+             severity  => -9,
+             msg       => -5,
+             timestamp => 50,
+            );
+  my $t=lc $_[0];
+  return $prios{$t} if defined $prios{$t};
+  return 0;
+}
+
+sub build_mysql_exec {
+  my $bin = shift;
+  my @mysql_options = ($config->mysql_bindir ? File::Spec->catfile($config->mysql_bindir,$bin) : $bin);
+  if ($config->mysql_defaults_file) {
+    push(@mysql_options, '"--defaults-file='.$config->mysql_defaults_file.'"');
+  }
+  if($bin eq 'mysqldump') {
+    if ($config->mysql_ignore_table and @{$config->mysql_ignore_table} > 0) {
+      foreach my $t (@{$config->mysql_ignore_table}) {
+        push(@mysql_options,"--ignore-table=${t}");
+      }
+    }
+    if ($config->mysql_single_transaction) {
+      push(@mysql_options, '--single-transaction');
+    }
+    if ($config->mysql_extra_option and scalar @{$config->mysql_extra_option} > 0) {
+        push(@mysql_options, @{$config->mysql_extra_option});
+    }
+  }
+  if ($config->mysql_user) {
+    push(@mysql_options, '-u'.$config->mysql_user);
+  }
+  if ($config->mysql_hostname) {
+    push(@mysql_options, '-h'.$config->mysql_hostname);
+  }
+  if ($config->mysql_password) {
+    push(@mysql_options, '-p"'.$config->mysql_password.'"');
+  }
+  return join(' ',@mysql_options);
+}
+
+sub mysql_database_list {
+  my $mysql_com = build_mysql_exec('mysql');
+  my $mysql_handle;
+  my @dl;
+  if (open $mysql_handle, '-|', "${mysql_com} -e \"SHOW DATABASES;\"") {
+    my $c=0;
+    while(<$mysql_handle>) {
+      chomp $_;
+      push(@dl,$_) unless $c == 0;
+      $c++;
+    }
+  }
+  else {
+    dlog('critical','unable to launch mysql for listing databases',{return_code => POSIX::WEXITSTATUS($?)});
+  }
+  return @dl;
+}
+
+sub init_config {
+    $config = AppConfig->new(
+        { GLOBAL => { EXPAND => EXPAND_VAR | EXPAND_ENV, }, } );
+
+    $config->define(
+        'log_level' => {
+            ALIAS    => "loglevel|level|log-level",
+            DEFAULT  => 'info',
+            ARGCOUNT => ARGCOUNT_ONE,
+            ARGS     => '=s',
+            VALIDATE =>
+                '^(debug|info|notice|warning|error|critical|alert|emergency)$'
+        },
+        'facility' => {
+            DEFAULT  => 'user',
+            ARGCOUNT => ARGCOUNT_ONE,
+            ARGS     => '=s',
+            VALIDATE =>
+                '^(auth|authpriv|cron|daemon|kern|local[0-7]|mail|news|syslog|user|uucp)$',
+        },
+        'mysql_skip_database' => {
+            DEFAULT =>
+                [ '#lost+found', 'performance_schema', 'information_schema' ],
+            ARGCOUNT => ARGCOUNT_LIST,
+            ARGS     => '=s@',
+        },
+        'postgresql_skip_database' => {
+            DEFAULT  => ['#lost+found'],
+            ARGCOUNT => ARGCOUNT_LIST,
+            ARGS     => '=s@',
+        },
+        'compression' => {
+            DEFAULT  => 'gzip',
+            ARGCOUNT => ARGCOUNT_ONE,
+            ARGS     => '=s',
+            VALIDATE => '^(' . join( '|', keys(%compressors), 'custom', 'none' ). ')$',
+        },
+        'compress' => {
+            ARGCOUNT => ARGCOUNT_ONE,
+            ARGS     => '=s',
+        },
+        'uncompress' => {
+            ARGCOUNT => ARGCOUNT_ONE,
+            ARGS     => '=s',
+        },
+        'extension' => {
+            ARGCOUNT => ARGCOUNT_ONE,
+            ARGS     => '=s',
+        },
+        'backup_location=s' => {
+            DEFAULT => '/var/delta-dumper/backups',
+            VALIDATE => '^\/.+',    # require an absolute path?
+        },
+        'tmpdir' => {
+            ALIAS    => 'tmp_dir|tempdir|temp_dir',
+            ARGS     => '=s',
+            VALIDATE => '^\/.+',       # require an absolute path?
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'dump_config' => {
+            ALIAS    => 'dump-config',
+            ARGS     => '!',
+            ARGCOUNT => ARGCOUNT_NONE,
+        },
+        'log_location=s' => {
+            DEFAULT => $USER eq 'root'
+            ? '/var/log'
+            : File::Spec->catfile( $HOME, 'var', 'log' ),
+            VALIDATE => '^\/.+',    # require an absolute path?
+        },
+        'h|help!',
+        'mysql_bindir' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+            VALIDATE => '^\/.+',        # require an absolute path?
+        },
+        'postgresql_bindir' => {
+            DEFAULT  => '/usr/bin',
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+            VALIDATE => '^\/.+',        # require an absolute path?
+        },
+        'postgresql_dump_database' => {
+            ARGS     => '=s@',
+            ARGCOUNT => ARGCOUNT_LIST,
+        },
+        'postgresql_extra_option' => {
+            DEFAULT  => ['--clean','--if-exists'],
+            ARGS     => '=s@',
+            ARGCOUNT => ARGCOUNT_LIST,
+        },
+        'postgresql_username' => {
+            DEFAULT  => 'postgres',
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'postgresql_host' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mysql!',
+        'postgresql!',
+        'localcow!',
+        'sys_logging' => {
+            DEFAULT  => 1,
+            ARGS     => '!',
+            ALIAS    => 'syslog',
+            ARGCOUNT => ARGCOUNT_NONE,
+        },
+        'terminal_logging' => {
+
+            # if stderr is a terminal, enable terminal_loging
+            DEFAULT  => -t STDERR ? 1 : 0,
+            ARGS     => '!',
+            ALIAS    => 't',
+            ARGCOUNT => ARGCOUNT_NONE,
+        },
+        'file_logging' => {
+            DEFAULT  => 1,
+            ARGS     => '!',
+            ARGCOUNT => ARGCOUNT_NONE,
+        },
+        'mysql_defaults_file' => {
+            ALIAS    => 'mysql_defaults-file|defaults-file',
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mysql_single_transaction' => {
+            DEFAULT  => 1,
+            ARGS     => '!',
+            ALIAS    => 'single-transaction|mysql_single-transaction',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mysql_ignore_table' => {
+            DEFAULT  => ['mysql.events'],
+            ARGS     => '=s@',
+            ALIAS    => 'mysql_ignore-table|ignore-table',
+            ARGCOUNT => ARGCOUNT_LIST,
+        },
+        'mysql_user' => {
+            ARGS     => '=s',
+            ALIAS    => 'mysql-user',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mysql_password' => {
+            ARGS     => '=s',
+            ALIAS    => 'mysql-password',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mysql_hostname' => {
+            ARGS     => '=s',
+            ALIAS    => 'mysql-hostname',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mysql_extra_option' => {
+            ARGS     => '=s@',
+            ARGCOUNT => ARGCOUNT_LIST,
+        },
+        'daily' => {
+            ARGS     => '=i',
+            ARGCOUNT => ARGCOUNT_ONE,
+            VALIDATE => '^\d+$',
+        },
+        'weekly' => {
+            ARGS     => '=i',
+            ARGCOUNT => ARGCOUNT_ONE,
+            VALIDATE => '^\d+$',
+        },
+        'monthly' => {
+            ARGS     => '=i',
+            ARGCOUNT => ARGCOUNT_ONE,
+            VALIDATE => '^\d+$',
+        },
+        'week_start' => {
+            DEFAULT  => 'Sun',
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+            VALIDATE => '^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$',
+        },
+        'month_start' => {
+            DEFAULT  => '1',
+            ARGS     => '=i',
+            ARGCOUNT => ARGCOUNT_ONE,
+            VALIDATE => '^[0-9]+$',
+        },
+        'rsync_binary' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+            DEFAULT  => 'rsync',
+        },
+        'rsync_options' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+            DEFAULT  => '-a --inplace --no-whole-file',
+        },
+        'prerun' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'postrun' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+    );
+}
+
+sub main {
+  init_config();
+  parse_config();
+
+  # set up our dispatch destinations:
+  $DISPATCHER = create_dispatcher();
+
+  ## Starting up:
+  $RUNTIME=time();
+  dlog('info','starting',{});
+
+  ## Dump the config if request, and exit:
+  if ($config->dump_config) {
+    print Dumper $config if $config->dump_config;
+    die "configuration dump requested and delivered, exiting";
+  }
+
+  sanity_check_config();
+
+  # obtain the global lock, or die trying
+  my $GLOBAL_LOCK = lock_pid_file($APP_NAME);
+  unless ( $GLOBAL_LOCK ) {
+    my $emsg='unable to lock pid file: '.lock_file_compose($APP_NAME);
+    dlog('warning',$emsg,{});
+    die $emsg;
+  }
+
+  unless ( -d $config->backup_location ) {
+    dlog('critical', 'backup location does not exist', { backup_location => $config->backup_location });
+      die "output directory does not exist and WILL NOT be created: ".$config->backup_location;
+  }
+  # create sub-directories:
+  foreach my $p (qw( daily weekly monthly current )) {
+    my $ddir = File::Spec->catfile($config->backup_location,$p);
+    unless ( -d $ddir or mkdir($ddir)) {
+      dlog('critical',
+           "output directory does not exist and cannot be created: ${ddir}",
+           { backup_location => $config->backup_location, ddir => $ddir });
+      die "output directory does not exist and cannot be created: ${ddir}";
+    }
+  }
+
+  system($config->prerun) if $config->prerun;
+
+  # do something useful here:
+  if ($config->mysql) {
+      foreach my $db (mysql_database_list()) {
+          if ( $config->mysql_skip_database
+               and string_any($db,@{$config->mysql_skip_database}) ) {
+              dlog('info',
+                   'skipping database',
+                   { databasetype => 'mysql', databasename => $db },
+                  );
+              next;
+          }
+          perform_backup('mysql',$db);
+      }
+  }
+  if ($config->postgresql) {
+      foreach my $db (@{$config->postgresql_dump_database}) {
+          perform_backup('postgresql',$db);
+      }
+  }
+
+  system($config->postrun) if $config->postrun;
+
+  # release the lock explicitly, although there really is no need to do so:
+  unlock_pid_file($GLOBAL_LOCK);
+  dlog('info',
+       'exiting',
+       {'total_run_time_seconds' => time()-$RUNTIME});
+}
+
+sub parse_config {
+  ## Configuration file parsing:
+  # parse --config command line options, removing it from @ARGV
+  GetOptions('config_file|config|config-file=s' => \$CONFIG_FILE,
+             'restore'                          => \$RESTORE,
+            );
+  # read the config file
+  if ( -f $CONFIG_FILE ) {
+    $config->file($CONFIG_FILE);
+  } else {
+    warn "configuration file does not exist (${CONFIG_FILE}), proceeding from command line options only";
+  }
+  ## Command Line Parsing:
+  $config->getopt;
+  # if there is anything left, we must acquit:
+  if (@ARGV > 0) {
+    die "unparsed remaining command line options: @{ARGV}";
+  }
+
+  # print usage if request:
+  pod2usage(-1) if $config->help;
+}
+
+sub perform_backup {
+    my $databasetype = shift;
+    my $database = shift;
+    my %logparams = ( databasetype => $databasetype,
+                      compression => $config->compression,
+                      backup_location => $config->backup_location,
+                    );
+    $logparams{databasename} = $database;
+    # record the time for logging:
+    my $start_time = time();
+    # this is the directory we intend to write the dump to:
+    my $current_dir = File::Spec->catfile($config->backup_location,'current');
+    # suffix or not:
+    my $suffix = ($config->compression eq 'none' ? '' : '.'.$compressors{$config->compression}{'extension'});
+    # just the file part of the intended backup:
+    my $file_name = "${databasetype}-${database}.sql" . $suffix;
+    # the backup path is the full path to the database dump we are
+    # trying to create:
+    my $backup_path = File::Spec->catfile($current_dir,$file_name);
+    # output_path is a full path to a temporary file to initially dump
+    # the database into:
+    my ($_of,$output_path) = tempfile("${file_name}.XXXXXXXX",
+                                      DIR => $config->tmpdir ? $config->tmpdir : $current_dir);
+    # this timestamp should be used in the creation of the symlinks:
+    my $backup_timestamp = strftime "%FT%T",  localtime($start_time);
+
+    # could probably use a function reference here:
+    my $return_value = 0;
+    if ( $databasetype eq 'mysql' ) {
+        $return_value = mysql_dump($database,$output_path,\%logparams);
+    }
+    elsif ( $databasetype eq 'postgresql' ) {
+        $return_value = postgresql_dump($database,$output_path,\%logparams);
+    }
+    else {
+        my $dmsg = "unknown database type: ${databasetype}";
+        dlog('critical',$dmsg, \%logparams);
+        die $dmsg;
+    }
+
+    if ($return_value != 1) {
+        # presumed to have failed... I think we need to clean up manually
+        dlog('info','perform cleanup', \%logparams);
+        unlink $output_path;
+    }
+    else { # $return_value MUST be 1, otherwise the first clause should match
+      # 1 is happy
+      # this is the relative link path to the current backup in current:
+      my $relative_name = File::Spec->catfile('..','current',$file_name);
+
+      if($config->localcow and -f $backup_path) {
+        my %lp = %logparams; # is this a copy???
+        my ($_tf,$tf_path) = tempfile("${file_name}.XXXXXXXX",
+                                      DIR => $config->backup_location);
+        my $result = rsync($backup_path,$tf_path);
+        if($result != 0) {
+          unlink $tf_path;
+          next;
+        }
+        link_symlinks("${databasetype}-${database}*", $relative_name, $tf_path);
+        unlink $tf_path;
+      }
+      else {
+        # look in each directory for symlinks to the current file:
+        link_symlinks("${databasetype}-${database}*", $relative_name, $backup_path);
+      }
+
+      # remove the old output file, now that the hard links will
+      # preserve it:
+      if( -f $backup_path and not $config->localcow) {
+        unlink $backup_path;
+      }
+
+      # rename our temp file into the file we're trying to create:
+      my $rename_result=0;
+      unless($config->localcow) {
+        if(rename $output_path, $backup_path) {
+          $rename_result=1;
+        }
+        elsif( $! eq 'Invalid cross-device link' ) {
+          # this is ok to continue, we can just use rsync later
+          $rename_result=0;
+        }
+        else {
+          my %lp = %logparams; # is this a copy???
+          $lp{errno} = $!;
+          dlog('error', 'rename error', \%lp);
+          unlink $output_path;
+          next;
+        }
+      }
+      if($rename_result == 0 or $config->localcow) {
+        my $result = rsync($output_path,$backup_path);
+        unlink $output_path if -f $output_path;
+        if($result != 0) {
+          next;
+        }
+      }
+      # create a series of symlinks to this path...
+      # we do this to keep rsync from having to work so hard
+      # preserving the hard links:
+      symlink $relative_name,
+        File::Spec->catfile( $config->backup_location,
+                             'daily', "${databasetype}-${database}.sql.${backup_timestamp}" . $suffix );
+      if ( strftime( "%a", localtime($start_time) ) eq $config->week_start ) {
+        symlink $relative_name,
+          File::Spec->catfile( $config->backup_location,
+                               'weekly',
+                               "${databasetype}-${database}.sql.${backup_timestamp}" . $suffix );
+      }
+      if ( strftime( "%d", localtime($start_time) ) eq sprintf('%02d', $config->month_start) ) {
+        symlink $relative_name,
+          File::Spec->catfile( $config->backup_location,
+                               'monthly',
+                               "${databasetype}-${database}.sql.${backup_timestamp}" . $suffix );
+      }
+      clean_old_dumps("${databasetype}-${database}*");
+  }
+}
+
+# use daily/weekly/monthly values to remove files
+sub clean_old_dumps {
+  my $filepat = shift;
+
+  foreach my $p (qw( daily weekly monthly )) {
+    my $dir = File::Spec->catfile($config->backup_location,$p);
+    my $n = $config->get($p) ? $config->get($p) : 0;
+    $n = $n * 7 if $p eq 'weekly';
+    $n = $n * 31 if $p eq 'monthly';
+    $n *= 86400; # convert to seconds
+    foreach my $file (glob(File::Spec->catfile($dir,$filepat))) {
+      next if -l $file; # explicitly skip symlinks
+      next unless -f $file; # do not act on non-regular files
+      if( basename($file) =~ /(\d\d\d\d\-\d\d\-\d\dT\d\d:\d\d:\d\d)/ ) {
+        if( time() - str2time(basename($1)) > $n ) {
+          if( unlink $file ) {
+            dlog('info','unlink dump', { file => $file, file_datetime => $1 });
+          }
+          else {
+            dlog('error','unlink dump failure', { file => $file, file_datetime => $1, errno => $! });
+          }
+        }
+      }
+    }
+  }
+}
+
+sub verify_mysql_backup {
+    my $backup_path = shift;
+    if ( $config->compression eq 'none' ) {
+        system("tail -n 1 ${backup_path} | grep -q 'Dump completed'");
+    }
+    else {
+        system(
+            "$compressors{$config->compression}{'uncompress'} ${backup_path} | tail -n 1 | grep -q 'Dump completed'"
+        );
+    }
+    if ( $? == 0 ) {    # check the return code
+        dlog('info', 'dump verify', { backup_path => $backup_path, exit => POSIX::WEXITSTATUS($?) });
+        return 1;
+    }
+    dlog('error', 'dump verify', { backup_path => $backup_path, exit => POSIX::WEXITSTATUS($?) });
+    return 0;
+}
+
+sub mysql_dump {
+  my $database = shift;
+  my $backup_path = shift;
+  my $logparams = shift;
+
+  my $mysql_exec = build_mysql_exec('mysqldump');
+
+  my $exec = "${mysql_exec} ${database}";
+  if ($config->compression eq 'none') {
+    $exec = "${exec} > ${backup_path}";
+  }
+  else {
+    $exec = "/bin/bash -c 'set -o pipefail ; ${exec} | ${compressors{$config->compression}{compress}} > ${backup_path}'";
+  }
+
+  $logparams->{exec} = $exec;
+  $logparams->{backup_path} = $backup_path;
+
+  dlog('debug','starting dump',$logparams);
+  delete $logparams->{exec};
+
+  system($exec);
+  $logparams->{exit} = POSIX::WEXITSTATUS($?);
+  if ( $logparams->{exit} != 0 or verify_mysql_backup($backup_path) == 0) {
+    dlog('error','dump status',$logparams);
+    return 0;
+  }
+  else {
+    dlog('info','dump status',$logparams);
+    return 1;
+  }
+}
+
+sub postgresql_dump {
+  my $database = shift;
+  my $backup_path = shift;
+  my $logparams = shift;
+
+  my $pg_exec = build_postgresql_exec( $database eq 'all' ? 'pg_dumpall' : 'pg_dump' );
+
+  if ( $database ne 'all' ) {
+      $pg_exec = "${pg_exec} ${database}";
+  }
+  if ($config->compression eq 'none') {
+      $pg_exec = "su -l postgres -c '${pg_exec}' > ${backup_path}";
+  }
+  else {
+      $pg_exec = "/bin/bash -c 'set -o pipefail ; su -l postgres -c \"${pg_exec}\" | ${compressors{$config->compression}{compress}}' > ${backup_path}";
+  }
+
+  $logparams->{exec} = $pg_exec;
+  $logparams->{backup_path} = $backup_path;
+
+  dlog('debug','starting dump',$logparams);
+  delete $logparams->{exec};
+
+  system($pg_exec);
+  $logparams->{exit} = POSIX::WEXITSTATUS($?);
+  if ( $logparams->{exit} != 0 ) {
+    dlog('error','dump status',$logparams);
+    return 0;
+  }
+  else {
+    dlog('info','dump status',$logparams);
+    return 1;
+  }
+}
+
+sub build_postgresql_exec {
+    my $bin = shift;
+    my @com = ($config->postgresql_bindir ? File::Spec->catfile($config->postgresql_bindir,$bin) : $bin);
+
+    if( $config->postgresql_extra_option and scalar @{$config->postgresql_extra_option} > 0 ) {
+        push(@com, @{$config->postgresql_extra_option});
+    }
+
+    if ($config->postgresql_username) {
+        push(@com, '--username='.$config->postgresql_username);
+    }
+    if ($config->postgresql_host) {
+        push(@com, '--host='.$config->postgresql_host);
+    }
+    return join(' ',@com);
+}
+
+
+sub sanity_check_config {
+  unless ($config->mysql or $config->postgresql) {
+    my $emsg='neither mysql nor postgresql was specified, nothing to dump!';
+    dlog('error',$emsg,{});
+    die $emsg;
+  }
+  if ($config->compression eq 'custom') {
+    $compressors{'custom'} = {};
+    foreach my $p (qw( compress uncompress extension )) {
+      if ($config->get($p)) {
+        $compressors{'custom'}{$p} = $config->get($p);
+      }
+      else {
+        dlog('error',"when using custom compression, you must specify ${p} parameter");
+        die "when using custom compression, you must specify ${p} parameter";
+      }
+    }
+  }
+}
+
+sub link_symlinks {
+  my $pat = shift;
+  my $relative_name = shift;
+  my $backup_path = shift;
+  foreach my $p (qw( daily weekly monthly )) {
+    my $ddir = File::Spec->catfile($config->backup_location,$p);
+    foreach my $dbf (glob(File::Spec->catfile($ddir,$pat))) {
+      # if we find a relative link, turn it into a hard link before the file goes away:
+      if (-l $dbf and readlink($dbf) eq $relative_name) {
+        # remove this link whether the target exists or not, if
+        # the target of a link is missing it's useless anyway:
+        unlink($dbf);
+        # create a hard link to a path that's about to disappear:
+        link($backup_path, $dbf) if -f $backup_path;
+      }
+    }
+  }
+}
+
+sub rsync {
+  my ($src,$dst) = @_;
+  my %lp;
+  $lp{cmd} = sprintf '%s %s %s %s', $config->rsync_binary, $config->rsync_options, $src, $dst;
+  dlog('debug', 'rsync copy', \%lp);
+  system($lp{cmd});
+  $lp{exit} = POSIX::WEXITSTATUS($?);
+  if($lp{exit} != 0) {
+    dlog('error', 'rsync error', \%lp);
+    # what cleanup should we do?
+  }
+  return $lp{exit};
+}
+
+# copied from the old version of List::Util:
+sub string_any {
+    my $s = shift;
+    foreach (@_) {
+        return 1 if $s eq $_;
+    }
+    return 0;
+}
+
+=head1 NAME
+
+delta-dumper - wrapper for mysqldump, pg_dump, and xdelta
+
+=head1 SYNOPSIS
+
+B<delta-dumper> {B<-h|--help>} {B<--mysql|--no-mysql>} {B<--postgresql|--no-postgresql>}
+
+=head1 DESCRIPTION
+
+Parse a config file and command line, invoke various dump programs.
+
+=head1 OPTIONS
+
+=head2 MAJOR MODES
+
+delta-dumper's default mode is to dump databases and write them to the configured location.
+
+=over 4
+
+=item B<--restore>
+
+
+
+=back
+
+=head2 CONFIGURATION OPTIONS
+
+=over 4
+
+=item B<--mysql|--no-mysql> C<mysql>
+
+Default: false
+
+Perform (or don't) mysql database dumps.
+
+=item B<--postgresql|--no-postgresql> C<postgresql>
+
+Default: false
+
+Perform (or don't) postgresql database dumps.
+
+=item B<--tmpdir>=I<dir> C<tmpdir>
+
+Directory used to write the output of dump commands.  The default is
+to use the 'current' directory in the C<backup_location> directory.
+
+=item B<--localcow|--no-localcow> C<localcow> (Boolean)
+
+When localcow is set, we take great pains to ensure that we update the
+dump files with the latest changes using rsync, in hopes of minimizing
+the change in the file and therefore the amount of data used to
+capture those changes in a snapshot.
+
+localcow should be set when the backup_location is on a filesystem
+with cow or cow-like characteristics, ie: btrfs, zfs, netapp, etc.
+
+=item B<--postrun>=I<command> C<postrun>
+
+Run this command after all (not each) dumps.
+
+=item B<--prerun>=I<command> C<prerun>
+
+Run this command before all (not each) dumps.
+
+=back
+
+=head2 LOGGING OPTIONS
+
+=over 4
+
+=item B<--file_logging|--no-file_logging> C<file_logging>
+
+Default: true
+
+Enable or disable logging to configured log location.  The minimum
+severity (level) logged to the file is controlled by the log_level
+parameter.
+
+=item B<--sys_logging|--syslog|--no-sys_logging|--no-syslog> C<sys_logging>
+
+Default: true
+
+Enable or disable logging syslog.  The minimum severity (level) logged
+to the file is controlled by the log_level parameter and the facility
+used is configured with the paramater of the same name.
+
+=item B<--terminal_logging|-t|--no-terminal_logging|--no-t> C<terminal_logging>
+
+Default: true if stdout is a terminal, false otherwise.
+
+Enable or disable logging to stderr.  The minimum severity (level)
+logged to stderr is controlled by the log_level parameter.
+
+=item B<--log_location> C<log_location> (String)
+
+Set the directory for logging.  Default for root is /var/log and the
+default for non-root users is ~/var/log.
+
+=item B<--log_level|--level|--log-level|--loglevel> C<log_level> (String)
+
+Default: info
+
+Log messags of this severity and above will be written to the various
+logging outputs, if enabled.  These correspond to the long names of
+the syslog severities:
+
+C<^(debug|info|notice|warning|error|critical|alert|emergency)$>
+
+=item B<--facility> C<facility> (String)
+
+Default: user
+
+Use this facility when logging to syslog which must match:
+
+C<^(auth|authpriv|cron|daemon|kern|local[0-7]|mail|news|syslog|user|uucp)$>
+
+=back
+
+=head2 COMPRESSION OPTIONS
+
+=over 4
+
+=item B<--compression> C<compresion> (String)
+
+Default: gzip
+
+Use pre-configured compression commands, gzip, bzip2, xz, and zstd.
+
+Also, C<none> is accepted along with C<custom> which requires setting
+the compress, uncompress, and suffix configuration items.
+
+=item B<--compress> C<compress> (String)
+
+Compress command to use when compression is set to custom.  Must read
+from a file and write to stdout.
+
+IE: C<gzip --stdout>
+
+=item B<--uncompress> C<uncompress> (String)
+
+Uncompress command to use when compression is set to custom.  Must read
+from a file and write to stdout.
+
+IE: C<gzcat>
+
+=item B<--suffix|--extension> C<extension> (String)
+
+Suffix to use when creating files when compression is set to custom.
+Must read from a file and write to stdout. Do not specify the period
+before the suffix.
+
+IE: C<gz>
+
+=back
+
+=head2 MYSQL OPTIONS
+
+=over 4
+
+=item B<--mysql_bindir>=I<dir> C<mysql_bindir>
+
+If specified, use this directory to create the path to the mysql and
+mysqldump executables.  Otherwise, assume they are in the path.
+
+=item B<--mysql_defaults_file|--mysql_defaults-file|--defaults-file>=I<file>
+
+When invoking mysql and mysqldump, call them with --defaults-file and
+the value of this parameter.
+
+=item B<--mysql_single_transaction|--no-mysql_single_transaction|--single-transaction|--no-single-transaction> (Boolean)
+
+Default: true
+
+Pass --single-transaction to mysqldump, or not.
+
+=item B<--mysql_ignore_table>=I<table>
+
+Default: mysql.events
+
+Can be specified multiple times, each of which will be passed to the
+--ignore-table option of mysqldump.
+
+=item B<--mysql_user>=I<user>
+
+Passed to -u on mysql and mysqldump commands.
+
+=item B<--mysql_password>=I<password>
+
+Passed to -p on mysql and mysqldump commands.
+
+=item B<--mysql_hostname>=I<hostname>
+
+Passed to -h on mysql and mysqldump commands.
+
+=item B<--mysql_extra_option>=I<option> C<mysql_extra_option>
+
+Can be specified multiple times, options passed to mysqldump, if set.
+
+=back
+
+=head2 POSTGRESQL OPTIONS
+
+=over 4
+
+=item B<--postgresql_bindir>=I<dir> C<postgresql_bindir>
+
+If specified, use this directory to create the path to the postgresql
+dump executables.  Otherwise, assume they are in the path.
+
+=item B<--postgresql_dump_database>=I<db> C<postgresql_dump_database>
+
+List of databases to dump, can be specified multiple timees on the
+command line and in the config file.
+
+=item B<--postgresql_dump_all> C<postgresql_dump_all>
+
+Default: true
+
+If true, dump all.  If false assume that some list of databases was
+specified with the postgresql_dump_database directive.
+
+=item B<--postgresql_extra_option>=I<option> C<postgresql_extra_option>
+
+Default: --clean --if-exists
+
+Can be specified multiple times, options passed to dump or dump all.
+
+=item B<--postgresql_username>=I<username> C<postgresql_username>
+
+Default: postgres
+
+Passed to the --username= option of the dump programs.
+
+=item B<--postgresql_host>=I<hostname> C<postgresql_host>
+
+Passed to the --host= option of the dump programs.  If unset, don't
+pass --host at all.
+
+=back
+
+=head2 RETENTION OPTIONS
+
+=over 4
+
+=item B<--daily>=I<count>
+
+Keep <count> days worth of daily dumps.
+
+=item B<--weekly>=I<count>
+
+Keep <count> weeks worth of weekly dumps.
+
+=item B<--monthly>=I<count>
+
+Keep <count> months worth of monthly dumps.
+
+=item B<--week_start>=I<day>
+
+Default: Sun
+
+When the day matches this string (Sun, Mon, etc.) then a weekly backup
+will be created in addition to the daily.
+
+=item B<--month_start>=I<day>
+
+Default: 1
+
+When the month day matches this a monthly backup will be created in
+addition to the daily.
+
+=back
+
+=head2 RSYNC OPTIONS
+
+Rsync is used when rename won't work, which is when the temporary
+database file is across a filesystem boundary.
+
+=over 4
+
+=item B<--rsync_binary>
+
+DEFAULT: rsync
+
+Explicit path to rsync binary, if needed.
+
+=item B<--rsync_options>=I<option>
+
+DEFAULT: -a --inplace --no-whole-file
+
+Options to pass to rsync when copying files.
+
+=back
+
+=head1 RETURN VALUE
+
+=head1 ERRORS
+
+=head1 DIAGNOSTICS
+
+=head1 EXAMPLES
+
+=head1 ENVIRONMENT
+
+=head1 FILES
+
+=head2 F</etc/delta-dumper/config>
+
+Default config file when run as root.
+
+=head2 F<$HOME/.config/delta-dumper/config>
+
+Default config file when run as non-root.
+
+=head1 CAVEATS
+
+=head1 BUGS
+
+=head1 RESTRICTIONS
+
+=head1 NOTES
+
+=head1 AUTHOR
+
+Aran Cox <arancox@gmail.com>
+
+=head1 HISTORY
+
+=head1 SEE ALSO
+
+=over 4
+
+gzip(1), bzip2(1), zstd(1), xdelta(1)
+
+=back

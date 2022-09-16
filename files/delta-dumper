@@ -55,6 +55,11 @@ my %compressors = (
         'uncompress' => 'zstd -T0 --uncompress --stdout',
         'extension'  => 'zst',
     },
+    'compress' => {
+        'compress'   => 'compress -c',
+        'uncompress' => 'uncompress -c',
+        'extension'  => 'Z',
+    }
 );
 
 # global app configuration
@@ -596,6 +601,8 @@ sub perform_backup {
     # the backup path is the full path to the database dump we are
     # trying to create:
     my $backup_path = File::Spec->catfile($current_dir,$file_name);
+    # create a useful list of alternate possible last backups:
+    my @alternates = path_alternates($backup_path);
     # output_path is a full path to a temporary file to initially dump
     # the database into:
     my ($_of,$output_path) = tempfile("${file_name}.XXXXXXXX",
@@ -646,8 +653,13 @@ sub perform_backup {
 
       # remove the old output file, now that the hard links will
       # preserve it:
-      if( -f $backup_path and not $config->localcow) {
-        unlink $backup_path;
+      foreach my $alt (path_alternates($backup_path)) {
+          # delete all the current files for this backup, unless it's
+          # the one we intend to write in this pass and localcow is
+          # enabled:
+          next unless -f $alt;
+          next if ( $config->localcow and $backup_path eq $alt );
+          unlink $alt;
       }
 
       # rename our temp file into the file we're trying to create:
@@ -722,6 +734,21 @@ sub clean_old_dumps {
       }
     }
   }
+}
+
+sub path_alternates {
+    my $p = shift;
+    my @suffixes
+        = map { '.' . $compressors{$_}{extension}; } ( keys(%compressors) );
+
+    # create a list of possible alternative backup paths (if compression changes)
+    my @alternates = map {
+        my ( $f, $d, $s ) = fileparse( $p, @suffixes );
+        File::Spec->catfile( $d, $f . $_ );
+    } @suffixes;
+    my ( $f, $d, $s ) = fileparse( $p, @suffixes );
+    push @alternates, File::Spec->catfile( $d, $f );
+    return @alternates;
 }
 
 sub verify_mysql_backup {
@@ -852,11 +879,12 @@ sub link_symlinks {
   my $pat = shift;
   my $relative_name = shift;
   my $backup_path = shift;
+  my @alternates = path_alternates($relative_name);
   foreach my $p (qw( daily weekly monthly )) {
     my $ddir = File::Spec->catfile($config->backup_location,$p);
     foreach my $dbf (glob(File::Spec->catfile($ddir,$pat))) {
       # if we find a relative link, turn it into a hard link before the file goes away:
-      if (-l $dbf and readlink($dbf) eq $relative_name) {
+      if (-l $dbf and string_any(readlink($dbf),@alternates)) {
         # remove this link whether the target exists or not, if
         # the target of a link is missing it's useless anyway:
         unlink($dbf);

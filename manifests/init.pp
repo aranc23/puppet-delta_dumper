@@ -93,7 +93,13 @@ class delta_dumper
   Optional[Array[String]] $rsync_options = undef,
   Optional[String] $prerun = undef,
   Optional[String] $postrun = undef,
-  # list of vars for use in template:
+  # mongodb variables:
+  Optional[Stdlib::Absolutepath] $mongodb_bindir = undef,
+  Optional[String] $mongodb_username = undef,
+  Optional[String] $mongodb_password = undef,
+  Optional[Integer] $mongodb_port = undef,
+  Optional[String] $mongodb_hostname = undef,
+  Optional[Boolean] $mongodb_ssl = undef,
 )
 {
   contain delta_dumper::install

@@ -80,6 +80,12 @@ class delta_dumper::configure {
     'rsync_options',
     'prerun',
     'postrun',
+    'mongodb_bindir',
+    'mongodb_username',
+    'mongodb_password',
+    'mongodb_port',
+    'mongodb_hostname',
+    'mongodb_ssl',
   ]
   file { "${delta_dumper::etc_dir}/config":
     owner   => $delta_dumper::user,

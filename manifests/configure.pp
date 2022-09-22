@@ -80,6 +80,7 @@ class delta_dumper::configure {
     'rsync_options',
     'prerun',
     'postrun',
+    'mongodb',
     'mongodb_bindir',
     'mongodb_username',
     'mongodb_password',

@@ -94,6 +94,7 @@ class delta_dumper
   Optional[String] $prerun = undef,
   Optional[String] $postrun = undef,
   # mongodb variables:
+  Optional[Boolean] $mongodb = undef,
   Optional[Stdlib::Absolutepath] $mongodb_bindir = undef,
   Optional[String] $mongodb_username = undef,
   Optional[String] $mongodb_password = undef,

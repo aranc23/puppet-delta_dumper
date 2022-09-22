@@ -16,6 +16,7 @@ use Pod::Usage;
 eval { use Time::HiRes qw( time ); };
 use File::Spec;
 use Date::Parse;
+use Storable qw(lock_store lock_retrieve);
 
 # added from CPAN or system packages
 use Log::Dispatch;
@@ -69,14 +70,26 @@ my %databasetype_case = (
     'mongodb'    => 'MongoDB',
 );
 
+# list of readonly periods:
+my @periods = qw( daily weekly monthly );
+
 # global app configuration
 my $config;
+
+# global status variable for writing to, used by monitoring
+my $status; # it's a hashref
 
 # the path to the config file to be parsed
 my $CONFIG_FILE
     = $USER eq 'root'
     ? File::Spec->catfile( '/etc', $APP_NAME, 'config' )
     : File::Spec->catfile( $HOME, '.config', $APP_NAME, 'config' );
+
+# the path to the status file
+my $STATUS_FILE
+    = $USER eq 'root'
+    ? File::Spec->catfile( '/etc', $APP_NAME, 'status' )
+    : File::Spec->catfile( $HOME, '.config', $APP_NAME, 'status' );
 
 # unused, unloved, restore mode!
 my $RESTORE=0;
@@ -90,9 +103,6 @@ my $callback_clean = sub { my %t=@_;
 
 # global dispatcher variable for use in dlog() etc.
 my $DISPATCHER;
-
-# keeping track of run time
-my $RUNTIME;
 
 # create a logparams for logging, intended to be localized:
 our %logparams;
@@ -301,6 +311,30 @@ sub build_mysql_exec {
   return @mysql_options;
 }
 
+sub build_mongodb_exec {
+    my @options
+        = ( $config->mysql_bindir
+        ? File::Spec->catfile( $config->mysql_bindir, 'mongodump' )
+        : 'mongodump' );
+    push @options, '--archive';
+    if ( $config->mysql_username ) {
+        push( @options, '--username', $config->mongodb_username );
+    }
+    if ( $config->mongodb_hostname ) {
+        push( @options, '--hostname', $config->mongodb_hostname );
+    }
+    if ( $config->mongodb_password ) {
+        push( @options, '--password', $config->mysql_password );
+    }
+    if ( $config->mongodb_ssl ) {
+        push( @options, '--ssl' );
+    }
+    if ( $config->mongodb_port ) {
+        push( @options, '--port', $config->mongodb_port );
+    }
+    return @options;
+}
+
 sub mysql_database_list {
   my $mysql_com = join(' ',build_mysql_exec('mysql'));
   my $mysql_handle;
@@ -383,6 +417,11 @@ sub init_config {
             ARGS     => '!',
             ARGCOUNT => ARGCOUNT_NONE,
         },
+        'dump_status' => {
+            ALIAS    => 'dump-status',
+            ARGS     => '!',
+            ARGCOUNT => ARGCOUNT_NONE,
+        },
         'log_location=s' => {
             DEFAULT => $USER eq 'root'
             ? '/var/log'
@@ -421,6 +460,7 @@ sub init_config {
         },
         'mysql!',
         'postgresql!',
+        'mongodb!',
         'localcow!',
         'sys_logging' => {
             DEFAULT  => 1,
@@ -522,6 +562,32 @@ sub init_config {
             ARGS     => '=s',
             ARGCOUNT => ARGCOUNT_ONE,
         },
+        'mongodb_bindir' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+            VALIDATE => '^\/.+',        # require an absolute path?
+        },
+        'mongodb_username' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mongodb_password' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mongodb_port' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mongodb_hostname' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mongodb_ssl' => {
+            DEFAULT  => 1,
+            ARGS     => '!',
+            ARGCOUNT => ARGCOUNT_NONE,
+        },
     );
 }
 
@@ -533,12 +599,12 @@ sub main {
   $DISPATCHER = create_dispatcher();
 
   ## Starting up:
-  $RUNTIME=time();
+  my $RUNTIME=time();
   dlog('info','starting',{});
 
   ## Dump the config if request, and exit:
   if ($config->dump_config) {
-    print Dumper $config if $config->dump_config;
+      print Dumper $config;
     die "configuration dump requested and delivered, exiting";
   }
 
@@ -557,7 +623,7 @@ sub main {
       die "output directory does not exist and WILL NOT be created: ".$config->backup_location;
   }
   # create sub-directories:
-  foreach my $p (qw( daily weekly monthly current )) {
+  foreach my $p (@periods,'current') {
     my $ddir = File::Spec->catfile($config->backup_location,$p);
     unless ( -d $ddir or mkdir($ddir)) {
       dlog('critical',
@@ -566,9 +632,37 @@ sub main {
       die "output directory does not exist and cannot be created: ${ddir}";
     }
   }
-
+  if ( -f $STATUS_FILE ) {
+      if ( $status = lock_retrieve($STATUS_FILE) and ref $status eq 'HASH' ) {
+          dlog('debug',
+               'retrieved status data',
+               { storable => $STATUS_FILE });
+      }
+      else {
+          dlog('warning',
+               'unable to retrieve status data, or data returned not a hash',
+               { storable => $STATUS_FILE });
+          $status = {};
+      }
+  }
+  else {
+      dlog('debug',
+           'status data does not exist, starting over',
+           { storable => $STATUS_FILE });
+      $status = {};
+  }
+  if ( $config->dump_status ) {
+      print Dumper $status;
+      die "dump request of status data, exiting";
+  }
   if ( $config->prerun ) {
-      system(pre_post_run_interpolate($config->prerun));
+      unless( system_runner('prerun', $config->prerun) ) {
+          unlock_pid_file($GLOBAL_LOCK);
+          dlog('error',
+               'exiting because prerun command failed',
+               {'total_run_time_seconds' => time()-$RUNTIME});
+          exit;
+      }
   }
 
   if ($config->mysql) {
@@ -581,50 +675,86 @@ sub main {
                   );
               next;
           }
-          perform_backup('mysql',$db);
+          my $t = perform_backup('mysql',$db);
+          my $s = 'success';
+          unless ($t) {
+              $s = 'failure';
+              $t = time();
+          }
+          $$status{mysql}{$db}{$s} = $t;
       }
   }
   if ($config->postgresql) {
       foreach my $db (@{$config->postgresql_dump_database}) {
-          perform_backup('postgresql',$db);
+          my $t = perform_backup('postgresql',$db);
+          my $s = 'success';
+          unless ($t) {
+              $s = 'failure';
+              $t = time();
+          }
+          $$status{postgresql}{$db}{$s} = $t;
       }
+  }
+  if ($config->mongodb) {
+      my $db = 'all';
+      my $t = perform_backup('mongodb',$db);
+      my $s = 'success';
+      unless ($t) {
+          $s = 'failure';
+          $t = time();
+      }
+      $$status{mongodb}{$db}{$s} = $t;
   }
 
   if ( $config->postrun ) {
-      system(pre_post_run_interpolate($config->postrun));
+      system_runner('postrun', $config->postrun);
   }
 
   # release the lock explicitly, although there really is no need to do so:
+  unless ( lock_store( $status, $STATUS_FILE) ) {
+      dlog('error',
+           'unable to store status information',
+           { storable => $STATUS_FILE });
+  }
   unlock_pid_file($GLOBAL_LOCK);
   dlog('info',
        'exiting',
        {'total_run_time_seconds' => time()-$RUNTIME});
 }
 
-# interpolate variables for pre and post run commands
-# $s: string to interpolate
-sub pre_post_run_interpolate {
-    my $s = shift;
-    return interpolate(
-        $s,
-        {   'BACKUP_LOCATION' => $config->backup_location,
-            'LOG_LOCATION'    => $config->log_location,
-            'TMPDIR'          => $config->tmpdir,
-            'COMPRESSION'     => $config->compression,
-            'COMPRESS'        => $compressors{compress},
-            'UNCOMPRESS'      => $compressors{uncompress},
-            'SUFFIX'          => $compressors{suffix},
-        },
-    );
-}
+sub system_runner {
+    local %logparams = %logparams;
+    local %ENV = %ENV;
+    my $prefix = uc $APP_NAME;
+    $prefix =~ s/\-/_/g;
 
-# $s: string to interplate
-# $h: hashref of key value pairs to use in subs
-sub interpolate {
-    my $s = shift;
-    my $h = shift;
-    $s =~ s/\%\{(\w+?)\}/$$h{$1}/g;
-    return $s;
+    my $tag = shift;
+    $logparams{cmd} = shift;
+
+    my %pairs = ('BACKUP_LOCATION' => $config->backup_location,
+                 'LOG_LOCATION'    => $config->log_location,
+                 'TMPDIR'          => $config->tmpdir,
+                 'COMPRESSION'     => $config->compression,
+                 'COMPRESS'        => $compressors{compress},
+                 'UNCOMPRESS'      => $compressors{uncompress},
+                 'SUFFIX'          => $compressors{suffix},
+             );
+    while ( my ($k,$v) = each %pairs) {
+        $ENV{join('_',$prefix, uc $k)} = $v;
+    }
+
+    unless( POSIX::WIFEXITED(system( $logparams{cmd} ) ) ) {
+        $logparams{errno} = "${ERRNO}";
+        dlog( 'error', $tag, \%logparams );
+        return;
+    }
+    $logparams{exit} = POSIX::WEXITSTATUS($CHILD_ERROR);
+    unless ( $logparams{exit} == 0 ) {
+        dlog( 'error', $tag, \%logparams );
+        return;
+    }
+    dlog( 'debug', $tag, \%logparams );
+    return 1;
 }
 
 sub parse_config {
@@ -662,6 +792,8 @@ sub backup_file_name_builder {
     return join('-',@_).($sufs ? '.'.join('.', @{$sufs}) : '');
 }
 
+# called perform backup, however it is mostly concerned with what
+# happens after the backup/dump is performed
 sub perform_backup {
     my $databasetype = shift;
     my $database = shift;
@@ -686,6 +818,7 @@ sub perform_backup {
     # the backup path is the full path to the database dump we are
     # trying to create:
     my $backup_path = File::Spec->catfile($current_dir,$file_name);
+    $logparams{backup_file} = $backup_path;
     # create a useful list of alternate possible last backups:
     my @alternates = path_alternates($backup_path);
     # output_path is a full path to a temporary file to initially dump
@@ -704,6 +837,9 @@ sub perform_backup {
     elsif ( $databasetype eq 'postgresql' ) {
         $return_value = postgresql_dump($database,$output_path);
     }
+    elsif ( $databasetype eq 'mongodb' ) {
+        $return_value = mongodb_dump($database,$output_path);
+    }
     else {
         my $dmsg = "unknown database type: ${databasetype}";
         dlog('critical',$dmsg, \%logparams);
@@ -716,13 +852,12 @@ sub perform_backup {
       my $relative_name = File::Spec->catfile('..','current',$file_name);
 
       if($config->localcow and -f $backup_path) {
-        my %lp = %logparams; # is this a copy???
+        local %logparams = %logparams; # is this a copy???
         my ($_tf,$tf_path) = tempfile("${file_name}.XXXXXXXX",
                                       DIR => $config->backup_location);
-        unless( rsync($backup_path,$tf_path) ) {
-            $lp{temp_file} = $tf_path;
-            $lp{backup_file} = $backup_path;
-            dlog('error', "unable to rsync from backup to location to temp file", \%lp);
+        $logparams{temp_file} = $tf_path;
+        unless ( rsync($backup_path,$tf_path) ) {
+            dlog('error', "unable to rsync from backup to location to temp file", \%logparams);
             unlink $tf_path;
             return;
         }
@@ -760,9 +895,9 @@ sub perform_backup {
           $rename_result=0;
         }
         else {
-          my %lp = %logparams; # is this a copy???
-          $lp{errno} = $!;
-          dlog('error', 'rename error', \%lp);
+          local %logparams = %logparams; # is this a copy???
+          $logparams{errno} = $!;
+          dlog('error', 'rename error', \%logparams);
           unlink $output_path;
           return;
         }
@@ -797,8 +932,11 @@ sub perform_backup {
                                'monthly',
                                $file_name_timestamp);
       }
-      clean_old_dumps(backup_file_name_builder(@file_parts).'*');
-      return 1;
+      dlog('notice',
+           "backup status",
+           \%logparams);
+      clean_old_dumps($config->backup_location, $databasetype, $database);
+      return $start_time;
   }
   else {
       # presumed to have failed... I think we need to clean up manually
@@ -811,29 +949,58 @@ sub perform_backup {
 
 # use daily/weekly/monthly values to remove files
 sub clean_old_dumps {
-  my $filepat = shift;
+    my $path = shift;
+    my $databasetype = shift;
+    my $databasename = shift;
+    local %logparams = %logparams;
 
-  foreach my $p (qw( daily weekly monthly )) {
-    my $dir = File::Spec->catfile($config->backup_location,$p);
-    my $n = $config->get($p) ? $config->get($p) : 0;
-    $n = $n * 7 if $p eq 'weekly';
-    $n = $n * 31 if $p eq 'monthly';
-    $n *= 86400; # convert to seconds
-    foreach my $file (glob(File::Spec->catfile($dir,$filepat))) {
-      next if -l $file; # explicitly skip symlinks
-      next unless -f $file; # do not act on non-regular files
-      if( basename($file) =~ /(\d\d\d\d\-\d\d\-\d\dT\d\d:\d\d:\d\d)/ ) {
-        if( time() - str2time(basename($1)) > $n ) {
-          if( unlink $file ) {
-            dlog('info','unlink dump', { file => $file, file_datetime => $1 });
-          }
-          else {
-            dlog('error','unlink dump failure', { file => $file, file_datetime => $1, errno => $! });
-          }
+ PERIOD:
+    foreach my $period (@periods) {
+        $logparams{'period'} = $period;
+        $logparams{'dir'} = File::Spec->catfile($path,$period);
+
+        my $n = $config->get($period) ? $config->get($period) : 0;
+        $n = $n * 7 if $period eq 'weekly';
+        $n = $n * 31 if $period eq 'monthly';
+        $n *= 86400; # convert to seconds
+
+    FILE:
+        foreach my $file (glob(File::Spec->catfile($logparams{'dir'},"${databasetype}-${databasename}*")),
+                          glob(File::Spec->catfile($path,            "${databasename}.${period}.sql.*")),
+                      ) {
+            next if -l $file; # explicitly skip symlinks
+            next unless -f $file; # do not act on non-regular files
+            $logparams{'file'} = $file;
+            my $timestamp;
+
+            if ( my ($i) = basename($file) =~ m{(\d\d\d\d . \d\d . \d\d T \d\d . \d\d . \d\d)}xms ) {
+                $timestamp = str2time($i);
+            }
+            elsif ( my ($year,$month,$day,$hour,$minute) = basename($file) =~ m{(\d\d\d\d) . (\d\d) . (\d\d) . (\d\d) . (\d\d)}xms ) {
+                $timestamp = mktime(0,
+                                    $minute,
+                                    $hour,
+                                    $day,
+                                    ($month - 1),
+                                    ($year - 1900)
+                                );
+            }
+            else {
+                dlog( 'error', "unable to parse time stamp from file", \%logparams );
+                next FILE;
+            }
+            $logparams{file_timestamp} = $timestamp;
+            $logparams{file_datetime} = localtime($timestamp);
+            if( (time() - $timestamp) > $n ) {
+                if( unlink $file ) {
+                    dlog('info','unlink dump', \%logparams );
+                }
+                else {
+                    dlog('error','unlink dump', \%logparams );
+                }
+            }
         }
-      }
     }
-  }
 }
 
 sub path_alternates {
@@ -934,7 +1101,53 @@ sub mysql_dump {
       return;
   }
   else {
-    dlog('notice','dump status',\%logparams);
+    dlog('info','dump status',\%logparams);
+    return 1;
+  }
+}
+
+sub mongodb_dump {
+  my $database = shift;
+  my $backup_path = shift;
+  local %logparams = %logparams;
+  $logparams{backup_path} = $backup_path;
+
+  my @exec = build_mongodb_exec();
+
+  my @pipelines = ( { 'stage' => 'dump', 'exec' => \@exec } );
+
+  unless ( $config->compression eq 'none' ) {
+      push(@pipelines,{
+          'stage' => 'compress',
+          'exec' => [
+              split(/\s+/,${compressors{$config->compression}{compress}}),
+          ],
+      });
+  }
+  my $start_time = time();
+  my $exit_map = pipeline(
+      \@pipelines,
+      undef,
+      $backup_path,
+  );
+  $logparams{runtime} = time() - $start_time;
+  $logparams{exit} = 0;
+ STAGE:
+  foreach my $hr (@pipelines) {
+      my $stage = $$hr{stage};
+      if (exists $$exit_map{$stage} and $$exit_map{$stage} != 0) {
+          $logparams{exit} = $$exit_map{$stage};
+          $logparams{failed_stage} = $stage;
+          last STAGE;
+      }
+  }
+
+  if ( $logparams{exit} != 0 ) {
+      dlog('error','dump status',\%logparams);
+      return;
+  }
+  else {
+    dlog('info','dump status',\%logparams);
     return 1;
   }
 }
@@ -956,16 +1169,18 @@ sub pipeline {
 
     if ($initial_input) {
         unless(open($input_handle, '<', $initial_input)) {
+            $logparams{file} = $initial_input;
             $logparams{errno} = $ERRNO;
-            dlog('error','dump status',\%logparams);
-            return;
+            dlog('error','unable to open input file',\%logparams);
+            die 'unable to open input file: '.$logparams{file};
         }
     }
     if ($final_output) {
         unless(open($output_handle, '>', $final_output)) {
+            $logparams{file} = $final_output;
             $logparams{errno} = $ERRNO;
-            dlog('error','dump status',\%logparams);
-            return;
+            dlog('error','unable to open output file',\%logparams);
+            die 'unable to open output file: '.$logparams{file};
         }
     }
 
@@ -980,8 +1195,8 @@ sub pipeline {
             my ($pr);
             unless(pipe($pr,$output)) {
                 $logparams{errno} = $ERRNO;
-                dlog('error','dump status',\%logparams);
-                return;
+                dlog('error','unable to call pipe()',\%logparams);
+                die 'unable to call pipe()';
             }
             # last interations read bits
             $input = $input_handle;
@@ -1002,7 +1217,8 @@ sub pipeline {
             dlog('debug',"waitpid in while loop returned child ${pid}",\%child_map);
             if(exists $child_map{$pid}) {
                 $exit_map{$child_map{$pid}} = POSIX::WEXITSTATUS(${^CHILD_ERROR_NATIVE});
-                dlog( 'debug', "waitpid returned child ${pid} with exit: ".$exit_map{ $child_map{$pid} },
+                dlog( 'debug',
+                      "waitpid returned child ${pid} with exit: ".$exit_map{ $child_map{$pid} },
                       \%exit_map );
                 delete $child_map{$pid};
                 $MAXWAIT=1;
@@ -1016,12 +1232,16 @@ sub pipeline {
             # set some signal handlers so that we can awak from pause
             local $SIG{CHLD} = sub { };
             local $SIG{ALRM} = sub { };
-            dlog('debug','waiting on '.(scalar(keys(%child_map))).' sub-processes to exit, pausing',\%logparams);
+            dlog('debug',
+                 'waiting on '.(scalar(keys(%child_map))).' sub-processes to exit, pausing',
+                 \%logparams);
             my $pause_start=time();
             alarm $MAXWAIT;
             pause;
             alarm 0;
-            dlog('debug',"paused for: ".sprintf('%.5f seconds',time()-$pause_start),\%logparams);
+            dlog('debug',
+                 "paused for: ".sprintf('%.5f seconds',time()-$pause_start),
+                 \%logparams);
         };
     } until( scalar(keys(%child_map)) == 0 );
     return(\%exit_map);
@@ -1118,7 +1338,7 @@ sub postgresql_dump {
         return;
     }
     else {
-        dlog( 'notice', 'dump status', \%logparams );
+        dlog( 'info', 'dump status', \%logparams );
         return 1;
     }
 
@@ -1167,7 +1387,7 @@ sub link_symlinks {
   my $relative_name = shift;
   my $backup_path = shift;
   my @alternates = path_alternates($relative_name);
-  foreach my $p (qw( daily weekly monthly )) {
+  foreach my $p (@periods) {
     my $ddir = File::Spec->catfile($config->backup_location,$p);
     foreach my $dbf (glob(File::Spec->catfile($ddir,$pat))) {
       # if we find a relative link, turn it into a hard link before the file goes away:
@@ -1194,17 +1414,15 @@ sub link_symlinks {
 
 sub rsync {
     my ( $src, $dst ) = @_;
-    my %lp = { src => $src, dst => $dst };
-    $lp{cmd} = sprintf '%s %s %s %s', $config->rsync_binary,
-        $config->rsync_options, $src, $dst;
-    system( $lp{cmd} );
-    $lp{exit} = POSIX::WEXITSTATUS($?);
-    if ( $lp{exit} != 0 ) {
-        dlog( 'error', 'rsync error', \%lp );
-        return;
-    }
-    dlog( 'debug', 'rsync copy', \%lp );
-    return 1;
+    local %logparams = %logparams;
+    $logparams{src} = $src;
+    $logparams{dst} = $dst;
+
+    return system_runner(
+        'rsync copy',
+        sprintf( '%s %s %s %s',
+            $config->rsync_binary, $config->rsync_options, $src, $dst )
+    );
 }
 
 # copied from the old version of List::Util:
@@ -1257,6 +1475,12 @@ Perform (or don't) mysql database dumps.
 Default: false
 
 Perform (or don't) postgresql database dumps.
+
+=item B<--mongodb|--no-mongodb> C<mongodb>
+
+Default: false
+
+Perform (or don't) mongodb database dumps.
 
 =item B<--tmpdir>=I<dir> C<tmpdir>
 
@@ -1454,6 +1678,39 @@ Passed to the --username= option of the dump programs.
 
 Passed to the --host= option of the dump programs.  If unset, don't
 pass --host at all.
+
+=back
+
+=head2 MONGODB OPTIONS
+
+=over 4
+
+=item B<--mongodb_bindir>=I<dir> C<mongodb_bindir>
+
+If specified, use this directory to create the path to the mongodb
+dump executable.  Otherwise, assume they are in the path.
+
+=item B<--mongodb_username>=I<username> C<mongodb_username>
+
+Passed to the --username= option of the dump programs.
+
+=item B<--mongodb_password>=I<password>
+
+Passed to --password on mongodump command.
+
+=item B<--mongodb_port>=I<port>
+
+Passed to --port on mongodump command.
+
+=item B<--mongodb_hostname>=I<hostname>
+
+Passed to --hostname on mongodump command.
+
+=item B<--mongodb_ssl|--no-mongodb_ssl>
+
+Default: true
+
+If true, pass --ssl to mongodump.
 
 =back
 

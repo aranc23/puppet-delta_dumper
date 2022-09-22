@@ -324,7 +324,7 @@ sub build_mongodb_exec {
         push( @options, '--hostname', $config->mongodb_hostname );
     }
     if ( $config->mongodb_password ) {
-        push( @options, '--password', $config->mysql_password );
+        push( @options, '--password', $config->mongodb_password );
     }
     if ( $config->mongodb_ssl ) {
         push( @options, '--ssl' );

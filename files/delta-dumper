@@ -284,7 +284,7 @@ sub build_mysql_exec {
   my $bin = shift;
   my @mysql_options = ($config->mysql_bindir ? File::Spec->catfile($config->mysql_bindir,$bin) : $bin);
   if ($config->mysql_defaults_file) {
-    push(@mysql_options, '"--defaults-file='.$config->mysql_defaults_file.'"');
+    push(@mysql_options, '--defaults-file='.$config->mysql_defaults_file);
   }
   if($bin eq 'mysqldump') {
     if ($config->mysql_ignore_table and @{$config->mysql_ignore_table} > 0) {
@@ -317,7 +317,7 @@ sub build_mongodb_exec {
         ? File::Spec->catfile( $config->mysql_bindir, 'mongodump' )
         : 'mongodump' );
     push @options, '--archive';
-    if ( $config->mysql_username ) {
+    if ( $config->mongodb_username ) {
         push( @options, '--username', $config->mongodb_username );
     }
     if ( $config->mongodb_hostname ) {

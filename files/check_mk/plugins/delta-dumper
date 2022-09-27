@@ -1,0 +1,13 @@
+#! /bin/bash
+
+com=/etc/delta-dumper/delta-dumper
+if [[ ! -x $com ]]; then
+    exit 0;
+fi
+t=$(mktemp)
+$com --level critical --status-json > $t
+if (( $( cat $t | wc -l ) > 0 )); then
+    echo "<<<delta-dumper>>>"
+    cat $t
+fi
+rm -f $t

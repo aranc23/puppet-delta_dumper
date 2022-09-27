@@ -15,8 +15,14 @@ use Env qw( HOME HOSTNAME SHORTNAME );
 use Pod::Usage;
 eval { use Time::HiRes qw( time ); };
 use File::Spec;
+use File::Path qw( make_path );
 use Date::Parse;
-use Storable qw(lock_store lock_retrieve);
+BEGIN {
+    @AnyDBM_File::ISA = qw(GDBM_File SDBM_File);
+}
+use JSON;
+use AnyDBM_File;
+use Storable qw( freeze thaw );
 
 # added from CPAN or system packages
 use Log::Dispatch;
@@ -76,23 +82,47 @@ my @periods = qw( daily weekly monthly );
 # global app configuration
 my $config;
 
-# global status variable for writing to, used by monitoring
-my $status; # it's a hashref
+my $STATE_DIR =
+    $USER eq 'root'                 ? File::Spec->catfile('/var/lib', $APP_NAME)
+    : exists $ENV{'XDG_STATE_HOME'} ? File::Spec->catfile($ENV{'XDG_STATE_HOME'}, $APP_NAME)
+    : exists $ENV{'HOME'}           ? File::Spec->catfile($ENV{'HOME'}, '.local', 'state', $APP_NAME)
+    : undef;
+
+my $LOCK_DIR =
+    $USER eq 'root' ? '/var/run' : $STATE_DIR;
+my $LOG_DIR =
+    $USER eq 'root' ? '/var/log' : $STATE_DIR;
+
+my $DB_FILE = File::Spec->catfile($STATE_DIR, "${APP_NAME}.db");
+my $DB_LOCK = join('.', $DB_FILE, 'lock');
+
+my $CONFIG_DIR =
+    $USER eq 'root'                  ? File::Spec->catfile('/etc',$APP_NAME)
+    : exists $ENV{'XDG_CONFIG_HOME'} ? File::Spec->catfile($ENV{'XDG_STATE_HOME'}, $APP_NAME)
+    : exists $ENV{'HOME'}            ? File::Spec->catfile($ENV{'HOME'}, '.config', $APP_NAME)
+    : undef;
+
+for my $dir ($STATE_DIR,$CONFIG_DIR) {
+    unless ( -d $dir ) {
+        my @created;
+        unless ( @created = make_path($dir, { mode => 0700 }) ) {
+            die "unable to create directory: ${dir}";
+        }
+        unless ($created[0] eq $dir) {
+            die "make_path did not return the expected result trying to create ${dir}";
+        }
+    }
+}
 
 # the path to the config file to be parsed
-my $CONFIG_FILE
-    = $USER eq 'root'
-    ? File::Spec->catfile( '/etc', $APP_NAME, 'config' )
-    : File::Spec->catfile( $HOME, '.config', $APP_NAME, 'config' );
-
-# the path to the status file
-my $STATUS_FILE
-    = $USER eq 'root'
-    ? File::Spec->catfile( '/etc', $APP_NAME, 'status' )
-    : File::Spec->catfile( $HOME, '.config', $APP_NAME, 'status' );
+my $CONFIG_FILE = File::Spec->catfile($CONFIG_DIR, 'config');
 
 # unused, unloved, restore mode!
 my $RESTORE=0;
+# if true, print the database status and exit
+my $STATUS_JSON;
+# delete these keys from the status database
+my @STATUS_DELETE;
 
 # create the call back for the dispatcher at the top level (probably
 # not needed)
@@ -105,7 +135,7 @@ my $callback_clean = sub { my %t=@_;
 my $DISPATCHER;
 
 # create a logparams for logging, intended to be localized:
-our %logparams;
+our %logparams=();
 
 # just ensure hostname is set to something
 unless($HOSTNAME and length $HOSTNAME > 0) {
@@ -192,7 +222,7 @@ sub create_dispatcher {
                Log::Dispatch::File->new(
                                         name      => 'logfile',
                                         min_level => $config->level,
-                                        filename  => File::Spec->catfile($config->log_location,"${APP_NAME}.log-".strftime('%Y%m%d',localtime(time()))),
+                                        filename  => File::Spec->catfile($LOG_DIR,"${APP_NAME}.log-".strftime('%Y%m%d',localtime(time()))),
                                         mode      => '>>',
                                        )
               );
@@ -403,7 +433,7 @@ sub init_config {
             ARGS     => '=s',
         },
         'backup_location=s' => {
-            DEFAULT => '/var/delta-dumper/backups',
+            DEFAULT => "/var/${APP_NAME}/backups",
             VALIDATE => '^\/.+',    # require an absolute path?
         },
         'tmpdir' => {
@@ -417,16 +447,11 @@ sub init_config {
             ARGS     => '!',
             ARGCOUNT => ARGCOUNT_NONE,
         },
-        'dump_status' => {
-            ALIAS    => 'dump-status',
-            ARGS     => '!',
-            ARGCOUNT => ARGCOUNT_NONE,
-        },
-        'log_location=s' => {
-            DEFAULT => $USER eq 'root'
-            ? '/var/log'
-            : File::Spec->catfile( $HOME, 'var', 'log' ),
+        'log_location' => {
+            DEFAULT => $LOG_DIR,
             VALIDATE => '^\/.+',    # require an absolute path?
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
         },
         'h|help!',
         'mysql_bindir' => {
@@ -598,6 +623,15 @@ sub main {
   # set up our dispatch destinations:
   $DISPATCHER = create_dispatcher();
 
+  if ( @STATUS_DELETE and scalar @STATUS_DELETE > 0 ) {
+      status_delete(@STATUS_DELETE);
+      exit;
+  }
+  if ( basename($PROGRAM_NAME) eq 'check_delta_dumper' or $STATUS_JSON ) {
+      status_json();
+      exit;
+  }
+
   ## Starting up:
   my $RUNTIME=time();
   dlog('info','starting',{});
@@ -632,29 +666,6 @@ sub main {
       die "output directory does not exist and cannot be created: ${ddir}";
     }
   }
-  if ( -f $STATUS_FILE ) {
-      if ( $status = lock_retrieve($STATUS_FILE) and ref $status eq 'HASH' ) {
-          dlog('debug',
-               'retrieved status data',
-               { storable => $STATUS_FILE });
-      }
-      else {
-          dlog('warning',
-               'unable to retrieve status data, or data returned not a hash',
-               { storable => $STATUS_FILE });
-          $status = {};
-      }
-  }
-  else {
-      dlog('debug',
-           'status data does not exist, starting over',
-           { storable => $STATUS_FILE });
-      $status = {};
-  }
-  if ( $config->dump_status ) {
-      print Dumper $status;
-      die "dump request of status data, exiting";
-  }
   if ( $config->prerun ) {
       unless( system_runner('prerun', $config->prerun) ) {
           unlock_pid_file($GLOBAL_LOCK);
@@ -675,47 +686,23 @@ sub main {
                   );
               next;
           }
-          my $t = perform_backup('mysql',$db);
-          my $s = 'success';
-          unless ($t) {
-              $s = 'failure';
-              $t = time();
-          }
-          $$status{mysql}{$db}{$s} = $t;
+          perform_backup('mysql',$db);
       }
   }
   if ($config->postgresql) {
       foreach my $db (@{$config->postgresql_dump_database}) {
-          my $t = perform_backup('postgresql',$db);
-          my $s = 'success';
-          unless ($t) {
-              $s = 'failure';
-              $t = time();
-          }
-          $$status{postgresql}{$db}{$s} = $t;
+          perform_backup('postgresql',$db);
       }
   }
   if ($config->mongodb) {
       my $db = 'all';
-      my $t = perform_backup('mongodb',$db);
-      my $s = 'success';
-      unless ($t) {
-          $s = 'failure';
-          $t = time();
-      }
-      $$status{mongodb}{$db}{$s} = $t;
+      perform_backup('mongodb',$db);
   }
 
   if ( $config->postrun ) {
       system_runner('postrun', $config->postrun);
   }
 
-  # release the lock explicitly, although there really is no need to do so:
-  unless ( lock_store( $status, $STATUS_FILE) ) {
-      dlog('error',
-           'unable to store status information',
-           { storable => $STATUS_FILE });
-  }
   unlock_pid_file($GLOBAL_LOCK);
   dlog('info',
        'exiting',
@@ -761,6 +748,8 @@ sub parse_config {
   ## Configuration file parsing:
   # parse --config command line options, removing it from @ARGV
   GetOptions('config_file|config|config-file=s' => \$CONFIG_FILE,
+             'status_json|status-json!'         => \$STATUS_JSON,
+             'status_delete|status-delete=s@'   => \@STATUS_DELETE,
              'restore'                          => \$RESTORE,
             );
   # read the config file
@@ -830,15 +819,16 @@ sub perform_backup {
     my $file_name_timestamp = backup_file_name_builder(@file_parts,$backup_timestamp,\@suffix);
 
     # could probably use a function reference here:
-    my $return_value = 0;
+    my $return_value;
+    my $stage;
     if ( $databasetype eq 'mysql' ) {
-        $return_value = mysql_dump($database,$output_path);
+        ($return_value,$stage) = mysql_dump($database,$output_path);
     }
     elsif ( $databasetype eq 'postgresql' ) {
-        $return_value = postgresql_dump($database,$output_path);
+        ($return_value,$stage) = postgresql_dump($database,$output_path);
     }
     elsif ( $databasetype eq 'mongodb' ) {
-        $return_value = mongodb_dump($database,$output_path);
+        ($return_value,$stage) = mongodb_dump($database,$output_path);
     }
     else {
         my $dmsg = "unknown database type: ${databasetype}";
@@ -846,8 +836,7 @@ sub perform_backup {
         die $dmsg;
     }
 
-    if ($return_value and $return_value == 1) { # $return_value MUST be 1, otherwise the first clause should match
-      # 1 is happy
+    if (defined $return_value and $return_value == 0) {
       # this is the relative link path to the current backup in current:
       my $relative_name = File::Spec->catfile('..','current',$file_name);
 
@@ -859,6 +848,9 @@ sub perform_backup {
         unless ( rsync($backup_path,$tf_path) ) {
             dlog('error', "unable to rsync from backup to location to temp file", \%logparams);
             unlink $tf_path;
+            update_status_db($databasetype, $database, { exit => 1,
+                                                         stage => 'rsync',
+                                                         start_time => $start_time, });
             return;
         }
         link_symlinks(backup_file_name_builder(@file_parts).'*',
@@ -899,6 +891,10 @@ sub perform_backup {
           $logparams{errno} = $!;
           dlog('error', 'rename error', \%logparams);
           unlink $output_path;
+          update_status_db($databasetype, $database, { exit => 1,
+                                                       stage => 'rename',
+                                                       start_time => $start_time,
+                                                       errno => $logparams{errno} });
           return;
         }
       }
@@ -909,6 +905,14 @@ sub perform_backup {
               $logparams{output_path} = $output_path;
               dlog('error', "unable to rsync from output path to backup location", \%logparams);
               unlink $output_path if -f $output_path;
+              update_status_db(
+                  $databasetype,
+                  $database,
+                  {   exit       => 1,
+                      stage      => 'rsync',
+                      start_time => $start_time,
+                  }
+              );
               return;
           }
           unlink $output_path if -f $output_path;
@@ -936,12 +940,17 @@ sub perform_backup {
            "backup status",
            \%logparams);
       clean_old_dumps($config->backup_location, $databasetype, $database);
+      update_status_db($databasetype, $database, { exit => 0,
+                                                   start_time => $start_time, });
       return $start_time;
   }
   else {
       # presumed to have failed... I think we need to clean up manually
       dlog('info','perform cleanup', \%logparams);
       unlink $output_path if -f $output_path;
+      update_status_db($databasetype, $database, { exit => $return_value,
+                                                   stage => $stage,
+                                                   start_time => $start_time });
   }
   dlog('error','perform backup fall through failure', \%logparams);
   return;
@@ -1097,13 +1106,14 @@ sub mysql_dump {
   }
 
   if ( $logparams{exit} != 0 or not verify_mysql_backup($backup_path)) {
+      $logparams{exit} = 1;
+      $logparams{failed_stage} = 'verify';
       dlog('error','dump status',\%logparams);
-      return;
   }
   else {
-    dlog('info','dump status',\%logparams);
-    return 1;
+      dlog('info','dump status',\%logparams);
   }
+  return ($logparams{exit}, $logparams{failed_stage});
 }
 
 sub mongodb_dump {
@@ -1142,14 +1152,8 @@ sub mongodb_dump {
       }
   }
 
-  if ( $logparams{exit} != 0 ) {
-      dlog('error','dump status',\%logparams);
-      return;
-  }
-  else {
-    dlog('info','dump status',\%logparams);
-    return 1;
-  }
+  dlog( ($logparams{exit} == 0 ? 'info' : 'error'), 'dump status', \%logparams );
+  return ($logparams{exit}, $logparams{failed_stage});
 }
 
 sub pipeline {
@@ -1333,15 +1337,8 @@ sub postgresql_dump {
         }
     }
 
-    if ( $logparams{exit} != 0 ) {
-        dlog( 'error', 'dump status', \%logparams );
-        return;
-    }
-    else {
-        dlog( 'info', 'dump status', \%logparams );
-        return 1;
-    }
-
+    dlog( ($logparams{exit} == 0 ? 'info' : 'error'), 'dump status', \%logparams );
+    return ($logparams{exit}, $logparams{failed_stage});
 }
 
 sub build_postgresql_exec {
@@ -1432,6 +1429,82 @@ sub string_any {
         return 1 if $s eq $_;
     }
     return 0;
+}
+
+sub lock_db {
+    my $flags = shift;
+    $flags = LOCK_EX unless $flags;
+    my $db_lock_handle;
+    local %logparams = %logparams;
+    $logparams{db_lock} = $DB_LOCK;
+
+    unless ( open($db_lock_handle, '>', $DB_LOCK) ) {
+        dlog('error', "unable to open database file ${DB_LOCK}", \%logparams);
+        return;
+    }
+    unless ( flock( $db_lock_handle, LOCK_EX ) ) {
+        dlog('error', "unable to lock database file ${DB_LOCK}", \%logparams);
+        return;
+    }
+    return $db_lock_handle;
+}
+
+sub unlock_db {
+    flock($_[0],LOCK_UN);
+    close($_[0]);
+}
+
+# update the state database
+sub update_status_db {
+    my ($dbtype, $dbname, $value) = @_;
+
+    my $db_lock_handle = lock_db();
+
+    my %status;
+    unless(tie %status, 'AnyDBM_File', $DB_FILE, O_CREAT|O_RDWR, 0666) {
+        dlog('error', "unable to open database file ${DB_FILE}", {db_file => $DB_FILE});
+        return;
+    }
+
+    $status{join('*', $dbtype, $dbname)} = freeze($value);
+
+    untie %status;
+    unlock_db($db_lock_handle);
+}
+
+sub status_delete {
+    my $h = lock_db(LOCK_EX);
+
+    my %status;
+    unless(tie %status, 'AnyDBM_File', $DB_FILE, O_RDWR, 0666) {
+        dlog('error', "unable to open database file ${DB_FILE} for deletions", {db_file => $DB_FILE});
+        return;
+    }
+
+    for my $k (@_) {
+        delete $status{$k} if exists $status{$k};
+    }
+
+    untie %status;
+    unlock_db($h);
+}
+
+sub status_json {
+    my $h = lock_db(LOCK_SH);
+
+    my %status;
+    unless(tie %status, 'AnyDBM_File', $DB_FILE, O_RDONLY, 0666) {
+        dlog('error', "unable to open database file ${DB_FILE} for reading", {db_file => $DB_FILE});
+        return;
+    }
+    my %json;
+    while(my ($k,$v)=each(%status)) {
+        $json{$k}=thaw($v);
+    }
+    my $json = JSON->new->pretty();
+    print $json->encode(\%json);
+    untie %status;
+    unlock_db($h);
 }
 
 =head1 NAME

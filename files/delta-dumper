@@ -1049,167 +1049,6 @@ sub path_alternates {
     return @alternates;
 }
 
-sub mysql_dump {
-  my $database = shift;
-  my $backup_path = shift;
-  local %logparams = %logparams;
-  $logparams{backup_path} = $backup_path;
-
-  my @mysql_exec = build_mysql_exec('mysqldump');
-  push(@mysql_exec, $database);
-
-  my @pipelines;
-  my @pipes = ( { 'stage' => 'dump', 'exec' => \@mysql_exec } );
-
-  my $verify_fifo = join('.',$backup_path,'fifo');
-  my $hash_fifo = join('.',$backup_path,'hash');
-
-  if ($config->rate_limit) {
-      push(@pipes, {
-          'stage' => 'pv',
-          'exec' => [ 'pv', '-L', $config->rate_limit ],
-      });
-  }
-  if ($config->mbuffer) {
-      push(@pipes,
-           {
-               'stage' => 'mbuffer-dump',
-               'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
-           },
-       );
-  }
-  if ($config->mysql_verify or $config->checksum) {
-      my @tees = ('tee');
-      if ($config->mysql_verify) {
-          push @tees, $verify_fifo;
-      }
-      if ($config->checksum) {
-          push @tees, $hash_fifo;
-      }
-      push(@pipes,
-           {
-               'stage' => 'tee',
-               'exec'  => \@tees,
-           },
-       );
-      if ($config->mbuffer) {
-          push(@pipes,
-               {
-                   'stage' => 'mbuffer-tee',
-                   'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
-               },
-           );
-      }
-  }
-  unless ( $config->compression eq 'none' ) {
-      push(@pipes,{
-          'stage' => 'compress',
-          'exec' => [
-              split(/\s+/,${compressors{$config->compression}{compress}}),
-          ],
-      });
-      if ($config->mbuffer) {
-          push(@pipes,
-               {
-                   'stage' => 'mbuffer-compress',
-                   'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
-               },
-           );
-      }
-  }
-  push(@pipelines,
-       { output_file => $backup_path,
-         pipes       => \@pipes,
-     });
-  if ($config->mysql_verify) {
-      mkfifo($verify_fifo, 0600) or die "unable to create fifo for verifying mysql dump";
-      push(@pipelines,{
-          input_file  => $verify_fifo,
-          output_file => '/dev/null',
-          pipes => [
-              { 'stage' => 'verify-tail', 'exec' => [ 'tail', '-n', '1' ] },
-              {   'stage' => 'verify',
-                  'exec'  => [ 'grep', '-q', 'Dump completed' ]
-              },
-          ],
-      });
-  }
-  if ($config->checksum) {
-      mkfifo($hash_fifo, 0600) or die "unable to create fifo for hashing dump";
-      my $lg;
-      open($lg, '>>', '/tmp/log') or die "unable to open log for append";
-      push(@pipelines,{
-          input_file    => $hash_fifo,
-          output_handle => $lg,
-          pipes         => [{ 'stage' => 'checksum', 'exec' => [ $config->checksum_binary ] }],
-      });
-      }
-
-  my $start_time = time();
-
-  my $exit_map = pipeline(@pipelines);
-
-  unlink $verify_fifo if -f $verify_fifo;
-  unlink $hash_fifo if -f $hash_fifo;
-
-  $logparams{runtime} = time() - $start_time;
-  $logparams{exit} = 0;
- PIPELINE:
-  foreach my $line (@pipelines) {
-  PIPE:
-      foreach my $p (@{$$line{pipes}}) {
-      STAGE:
-          my $stage = $$p{stage};
-          if (exists $$exit_map{$stage} and $$exit_map{$stage} != 0) {
-              $logparams{exit} = $$exit_map{$stage};
-              $logparams{failed_stage} = $stage;
-              last PIPELINE;
-          }
-      }
-  }
-  dlog( ($logparams{exit} == 0 ? 'info' : 'error'), 'dump status', \%logparams );
-  return ($logparams{exit}, $logparams{failed_stage});
-}
-
-sub mongodb_dump {
-  my $database = shift;
-  my $backup_path = shift;
-  local %logparams = %logparams;
-  $logparams{backup_path} = $backup_path;
-
-  my @exec = build_mongodb_exec();
-
-  my @pipelines = ( { 'stage' => 'dump', 'exec' => \@exec } );
-
-  unless ( $config->compression eq 'none' ) {
-      push(@pipelines,{
-          'stage' => 'compress',
-          'exec' => [
-              split(/\s+/,${compressors{$config->compression}{compress}}),
-          ],
-      });
-  }
-  my $start_time = time();
-  my $exit_map = pipeline(
-      {   output_file => $backup_path,
-          pipes       => \@pipelines,
-      }
-  );
-  $logparams{runtime} = time() - $start_time;
-  $logparams{exit} = 0;
- STAGE:
-  foreach my $hr (@pipelines) {
-      my $stage = $$hr{stage};
-      if (exists $$exit_map{$stage} and $$exit_map{$stage} != 0) {
-          $logparams{exit} = $$exit_map{$stage};
-          $logparams{failed_stage} = $stage;
-          last STAGE;
-      }
-  }
-
-  dlog( ($logparams{exit} == 0 ? 'info' : 'error'), 'dump status', \%logparams );
-  return ($logparams{exit}, $logparams{failed_stage});
-}
 
 sub pipeline {
     # params are an array of hashrefs, with the following possible keys:
@@ -1477,7 +1316,7 @@ sub generic_dump {
             push (@vpipes,
                   {
                       'stage' => 'mbuffer-verify',
-                      'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
+                      'exec'  => \@mb,
                   },
               );
         }
@@ -1501,7 +1340,7 @@ sub generic_dump {
             push (@cpipes,
                   {
                       'stage' => 'mbuffer-checksum',
-                      'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
+                      'exec'  => \@mb,
                   },
               );
         }
@@ -1565,49 +1404,6 @@ sub generic_dump {
     return ($logparams{exit}, $logparams{failed_stage});
 }
 
-sub postgresql_dump {
-    my $database = shift;
-    my $backup_path = shift;
-    my $backup_handle;
-    local %logparams = %logparams;
-    $logparams{backup_path} = $backup_path;
-
-    my @pg_exec = build_postgresql_exec( $database eq 'all' ? 'pg_dumpall' : 'pg_dump' );
-    if ( $database ne 'all' ) {
-        push(@pg_exec,$database);
-    }
-
-    my @pipelines = ( { 'stage' => 'dump', 'exec' => \@pg_exec, 'user' => 'postgres' } );
-    unless ( $config->compression eq 'none' ) {
-        push(@pipelines,{
-            'stage' => 'compress',
-            'exec' => [
-                split(/\s+/,${compressors{$config->compression}{compress}}),
-            ],
-        });
-    }
-
-    my $start_time = time();
-    my $exit_map = pipeline({
-        output_file => $backup_path,
-        pipes => \@pipelines,
-    });
-    $logparams{runtime} = time() - $start_time;
-    $logparams{exit} = 0;
-
- STAGE:
-    foreach my $hr (@pipelines) {
-        my $stage = $$hr{stage};
-        if ( exists $$exit_map{$stage} and $$exit_map{$stage} != 0 ) {
-            $logparams{exit}         = $$exit_map{$stage};
-            $logparams{failed_stage} = $stage;
-            last STAGE;
-        }
-    }
-
-    dlog( ($logparams{exit} == 0 ? 'info' : 'error'), 'dump status', \%logparams );
-    return ($logparams{exit}, $logparams{failed_stage});
-}
 
 sub build_postgresql_exec {
     my $bin = shift;

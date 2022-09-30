@@ -43,6 +43,12 @@ class delta_dumper::configure {
   $_vars = [
     'log_level',
     'facility',
+    'checksum',
+    'checksum_binary',
+    'mbuffer',
+    'mbuffer_binary',
+    'mbuffer_opts',
+    'rate_limit',
     'mysql_skip_database',
     'postgresql_skip_database',
     'compression',

@@ -90,6 +90,7 @@ class delta_dumper
   Optional[String] $mysql_password = undef,
   Optional[String] $mysql_hostname = undef,
   Optional[Array[String]] $mysql_extra_option = undef,
+  Optional[Boolean] $mysql_verify = undef,
   Optional[Integer] $daily = undef,
   Optional[Integer] $weekly = undef,
   Optional[Integer] $monthly = undef,

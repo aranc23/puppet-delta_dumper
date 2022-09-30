@@ -77,6 +77,7 @@ class delta_dumper::configure {
     'mysql_password',
     'mysql_hostname',
     'mysql_extra_option',
+    'mysql_verify',
     'daily',
     'weekly',
     'monthly',

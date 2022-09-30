@@ -158,7 +158,7 @@ main();
 
 ######## SUBROUTINES ########
 sub lock_file_compose {
-  return sprintf('%s/%s.lock',$config->backup_location,$_[0]);
+  return sprintf('%s/%s.lock',$LOCK_DIR,$_[0]);
 }
 sub lock_pid_file {
   my $MAXWAIT=30;
@@ -403,6 +403,36 @@ sub init_config {
             VALIDATE =>
                 '^(auth|authpriv|cron|daemon|kern|local[0-7]|mail|news|syslog|user|uucp)$',
         },
+        'checksum' => {
+            ARGS     => '!',
+            ARGCOUNT => ARGCOUNT_NONE,
+        },
+        'checksum_binary' => {
+            ARGS     => '=s',
+            ALIAS    => 'checksum-binary',
+            DEFAULT  => 'sha256sum',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mbuffer' => {
+            ARGS     => '!',
+            ARGCOUNT => ARGCOUNT_NONE,
+        },
+        'mbuffer_binary' => {
+            ARGS     => '=s',
+            ALIAS    => 'mbuffer-binary',
+            DEFAULT  => 'mbuffer',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'mbuffer_opts' => {
+            ARGS     => '=s',
+            ALIAS    => 'mbuffer-opts',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
+        'rate_limit' => {
+            ARGS     => '=s',
+            ALIAS    => 'rate-limit',
+            ARGCOUNT => ARGCOUNT_ONE,
+        },
         'mysql_skip_database' => {
             DEFAULT =>
                 [ '#lost+found', 'performance_schema', 'information_schema' ],
@@ -515,7 +545,7 @@ sub init_config {
             DEFAULT  => 1,
             ARGS     => '!',
             ALIAS    => 'single-transaction|mysql_single-transaction',
-            ARGCOUNT => ARGCOUNT_ONE,
+            ARGCOUNT => ARGCOUNT_NONE,
         },
         'mysql_ignore_table' => {
             DEFAULT  => ['mysql.events'],
@@ -541,6 +571,11 @@ sub init_config {
         'mysql_extra_option' => {
             ARGS     => '=s@',
             ARGCOUNT => ARGCOUNT_LIST,
+        },
+        'mysql_verify' => {
+            ARGS     => '!',
+            ALIAS    => 'mysql-verify',
+            ARGCOUNT => ARGCOUNT_NONE,
         },
         'daily' => {
             ARGS     => '=i',
@@ -821,20 +856,7 @@ sub perform_backup {
     # could probably use a function reference here:
     my $return_value;
     my $stage;
-    if ( $databasetype eq 'mysql' ) {
-        ($return_value,$stage) = mysql_dump($database,$output_path);
-    }
-    elsif ( $databasetype eq 'postgresql' ) {
-        ($return_value,$stage) = postgresql_dump($database,$output_path);
-    }
-    elsif ( $databasetype eq 'mongodb' ) {
-        ($return_value,$stage) = mongodb_dump($database,$output_path);
-    }
-    else {
-        my $dmsg = "unknown database type: ${databasetype}";
-        dlog('critical',$dmsg, \%logparams);
-        die $dmsg;
-    }
+    ($return_value,$stage) = generic_dump($databasetype,$database,$output_path);
 
     if (defined $return_value and $return_value == 0) {
       # this is the relative link path to the current backup in current:
@@ -1027,47 +1049,6 @@ sub path_alternates {
     return @alternates;
 }
 
-sub verify_mysql_backup {
-    local %logparams = %logparams;
-
-    my $backup_path = shift;
-    $logparams{backup_path} = $backup_path;
-    my @pipes = (
-        { 'stage' => 'tail', 'exec' => [ 'tail', '-v', '-n', '1' ] },
-        {   'stage' => 'grep',
-            'exec'  => [ 'grep', '-q', 'Dump completed' ]
-        },
-    );
-    if ( $config->compression ne 'none' ) {
-        unshift(@pipes,
-                {
-                    'stage' => 'uncompress',
-                    'exec' => [split(/\s+/,$compressors{$config->compression}{'uncompress'})],
-                }
-            );
-    }
-    my $start_time = time();
-    my $exit_map = pipeline(\@pipes, $backup_path);
-    $logparams{runtime} = time() - $start_time;
-    $logparams{exit} = 0;
- STAGE:
-    foreach my $hr (@pipes) {
-        my $stage = $$hr{stage};
-        if (exists $$exit_map{$stage} and $$exit_map{$stage} != 0) {
-            $logparams{failed_stage} = $stage;
-            $logparams{exit} = $$exit_map{$stage};
-            last STAGE;
-        }
-    }
-
-    if ( $logparams{exit} == 0 ) {    # check the return code
-        dlog('info', 'dump verify', \%logparams);
-        return 1;
-    }
-    dlog('error', 'dump verify', \%logparams);
-    return;
-}
-
 sub mysql_dump {
   my $database = shift;
   my $backup_path = shift;
@@ -1077,42 +1058,116 @@ sub mysql_dump {
   my @mysql_exec = build_mysql_exec('mysqldump');
   push(@mysql_exec, $database);
 
-  my @pipelines = ( { 'stage' => 'dump', 'exec' => \@mysql_exec } );
+  my @pipelines;
+  my @pipes = ( { 'stage' => 'dump', 'exec' => \@mysql_exec } );
 
+  my $verify_fifo = join('.',$backup_path,'fifo');
+  my $hash_fifo = join('.',$backup_path,'hash');
+
+  if ($config->rate_limit) {
+      push(@pipes, {
+          'stage' => 'pv',
+          'exec' => [ 'pv', '-L', $config->rate_limit ],
+      });
+  }
+  if ($config->mbuffer) {
+      push(@pipes,
+           {
+               'stage' => 'mbuffer-dump',
+               'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
+           },
+       );
+  }
+  if ($config->mysql_verify or $config->checksum) {
+      my @tees = ('tee');
+      if ($config->mysql_verify) {
+          push @tees, $verify_fifo;
+      }
+      if ($config->checksum) {
+          push @tees, $hash_fifo;
+      }
+      push(@pipes,
+           {
+               'stage' => 'tee',
+               'exec'  => \@tees,
+           },
+       );
+      if ($config->mbuffer) {
+          push(@pipes,
+               {
+                   'stage' => 'mbuffer-tee',
+                   'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
+               },
+           );
+      }
+  }
   unless ( $config->compression eq 'none' ) {
-      push(@pipelines,{
+      push(@pipes,{
           'stage' => 'compress',
           'exec' => [
               split(/\s+/,${compressors{$config->compression}{compress}}),
           ],
       });
-  }
-  my $start_time = time();
-  my $exit_map = pipeline(
-      \@pipelines,
-      undef,
-      $backup_path,
-  );
-  $logparams{runtime} = time() - $start_time;
-  $logparams{exit} = 0;
- STAGE:
-  foreach my $hr (@pipelines) {
-      my $stage = $$hr{stage};
-      if (exists $$exit_map{$stage} and $$exit_map{$stage} != 0) {
-          $logparams{exit} = $$exit_map{$stage};
-          $logparams{failed_stage} = $stage;
-          last STAGE;
+      if ($config->mbuffer) {
+          push(@pipes,
+               {
+                   'stage' => 'mbuffer-compress',
+                   'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
+               },
+           );
       }
   }
+  push(@pipelines,
+       { output_file => $backup_path,
+         pipes       => \@pipes,
+     });
+  if ($config->mysql_verify) {
+      mkfifo($verify_fifo, 0600) or die "unable to create fifo for verifying mysql dump";
+      push(@pipelines,{
+          input_file  => $verify_fifo,
+          output_file => '/dev/null',
+          pipes => [
+              { 'stage' => 'verify-tail', 'exec' => [ 'tail', '-n', '1' ] },
+              {   'stage' => 'verify',
+                  'exec'  => [ 'grep', '-q', 'Dump completed' ]
+              },
+          ],
+      });
+  }
+  if ($config->checksum) {
+      mkfifo($hash_fifo, 0600) or die "unable to create fifo for hashing dump";
+      my $lg;
+      open($lg, '>>', '/tmp/log') or die "unable to open log for append";
+      push(@pipelines,{
+          input_file    => $hash_fifo,
+          output_handle => $lg,
+          pipes         => [{ 'stage' => 'checksum', 'exec' => [ $config->checksum_binary ] }],
+      });
+      }
 
-  if ( $logparams{exit} != 0 or not verify_mysql_backup($backup_path)) {
-      $logparams{exit} = 1;
-      $logparams{failed_stage} = 'verify';
-      dlog('error','dump status',\%logparams);
+  my $start_time = time();
+
+  my $exit_map = pipeline(@pipelines);
+
+  unlink $verify_fifo if -f $verify_fifo;
+  unlink $hash_fifo if -f $hash_fifo;
+
+  $logparams{runtime} = time() - $start_time;
+  $logparams{exit} = 0;
+ PIPELINE:
+  foreach my $line (@pipelines) {
+  PIPE:
+      foreach my $p (@{$$line{pipes}}) {
+      STAGE:
+          my $stage = $$p{stage};
+          if (exists $$exit_map{$stage} and $$exit_map{$stage} != 0) {
+              $logparams{exit} = $$exit_map{$stage};
+              $logparams{failed_stage} = $stage;
+              last PIPELINE;
+          }
+      }
   }
-  else {
-      dlog('info','dump status',\%logparams);
-  }
+  dlog( ($logparams{exit} == 0 ? 'info' : 'error'), 'dump status', \%logparams );
   return ($logparams{exit}, $logparams{failed_stage});
 }
 
@@ -1136,9 +1191,9 @@ sub mongodb_dump {
   }
   my $start_time = time();
   my $exit_map = pipeline(
-      \@pipelines,
-      undef,
-      $backup_path,
+      {   output_file => $backup_path,
+          pipes       => \@pipelines,
+      }
   );
   $logparams{runtime} = time() - $start_time;
   $logparams{exit} = 0;
@@ -1157,61 +1212,82 @@ sub mongodb_dump {
 }
 
 sub pipeline {
-    my @pipes = @{ shift(@_) };
+    # params are an array of hashrefs, with the following possible keys:
+    # input_file or input_handle: used for the start of pipe
+    #   if both are undefined then close stdin
+    # output_file or output_handle: used the end of the pipe
+    #   if both are undefined then close stdin
+    # pipes: arrayref of hashrefs of commands to execute while being
+    #   joined by anonymous pipes:
+    #   stage: named stage (required)
+    #   exec:  arrayref of command to execute (required)
+    #   user: change to this user first (optional)
+    my @pipelines = @_;
 
     # pipes should look like this:
     # { 'stage' => 'compress', 'exec' => ['bzip2','-c'] },
     # etc.
-    my $initial_input = shift;
-    my $input_handle;
-    my $final_output = shift;    # file to write to
-    my $output_handle;
     my %child_map;               # map pids to stage
     my %exit_map;                #map stages to exit codes
     local %logparams = %logparams;
     my @stages;
-
-    if ($initial_input) {
-        unless(open($input_handle, '<', $initial_input)) {
-            $logparams{file} = $initial_input;
-            $logparams{errno} = $ERRNO;
-            dlog('error','unable to open input file',\%logparams);
-            die 'unable to open input file: '.$logparams{file};
+    foreach my $pipeline (@pipelines) {
+        #print STDERR Dumper $pipeline;
+        my $input_handle;
+        my $output_handle;
+        unless ( exists $$pipeline{pipes} and scalar @{$$pipeline{pipes}} > 0 ){
+            die "you must specify valid pipes to pipeline";
         }
-    }
-    if ($final_output) {
-        unless(open($output_handle, '>', $final_output)) {
-            $logparams{file} = $final_output;
-            $logparams{errno} = $ERRNO;
-            dlog('error','unable to open output file',\%logparams);
-            die 'unable to open output file: '.$logparams{file};
-        }
-    }
-
-    for my $pos (0..$#pipes) {
-        my ($input,$output);
-
-        if ($pos == $#pipes) { # we are the last iteration!
-            # also possible the only iteration?
-            ($input,$output) = ( $input_handle, $output_handle );
-        }
-        else {
-            my ($pr);
-            unless(pipe($pr,$output)) {
+        my @pipes = @{$$pipeline{pipes}};
+        #print STDERR Dumper \@pipes;
+        if (defined $$pipeline{input_file}) {
+            unless(open($input_handle, '<', $$pipeline{input_file})) {
+                $logparams{file} = $$pipeline{input_file};
                 $logparams{errno} = $ERRNO;
-                dlog('error','unable to call pipe()',\%logparams);
-                die 'unable to call pipe()';
+                dlog('error','unable to open input file',\%logparams);
+                die 'unable to open input file: '.$logparams{file};
             }
-            # last interations read bits
-            $input = $input_handle;
-            # save the read end of this
-            $input_handle = $pr;
         }
-        $child_map{split_fork_exec($input,
-                                   $output,
-                                   ( defined $pipes[$pos]{'user'} ? $pipes[$pos]{'user'} : undef ),
-                                   @{$pipes[$pos]{'exec'}}),
-               } = $pipes[$pos]{'stage'};
+        elsif ( defined $$pipeline{input_handle} ) {
+            $input_handle = $$pipeline{input_handle};
+        }
+        if (defined $$pipeline{output_file}) {
+            unless(open($output_handle, '>', $$pipeline{output_file})) {
+                $logparams{file} = $$pipeline{output_file};
+                $logparams{errno} = $ERRNO;
+                dlog('error','unable to open output file',\%logparams);
+                die 'unable to open output file: '.$logparams{file};
+            }
+        }
+        elsif ( defined $$pipeline{output_handle} ) {
+            $output_handle = $$pipeline{output_handle};
+        }
+    POS:
+        for my $pos (0..$#pipes) {
+            my ($input,$output);
+
+            if ($pos == $#pipes) { # we are the last iteration!
+                # also possible the only iteration?
+                ($input,$output) = ( $input_handle, $output_handle );
+            }
+            else {
+                my ($pr);
+                unless(pipe($pr,$output)) {
+                    $logparams{errno} = $ERRNO;
+                    dlog('error','unable to call pipe()',\%logparams);
+                    die 'unable to call pipe()';
+                }
+                # last interations read bits
+                $input = $input_handle;
+                # save the read end of this
+                $input_handle = $pr;
+            }
+            $child_map{split_fork_exec($input,
+                                       $output,
+                                       ( defined $pipes[$pos]{'user'} ? $pipes[$pos]{'user'} : undef ),
+                                       @{$pipes[$pos]{'exec'}}),
+                   } = $pipes[$pos]{'stage'};
+        }
     }
 
     my $MAXWAIT=1;
@@ -1296,6 +1372,199 @@ sub split_fork_exec {
     }
 }
 
+sub generic_dump {
+    local %logparams = %logparams;
+    # pass the type, database, and path? or also the primary dump exec command?
+    my $dbtype = shift;
+    my $database = shift;
+    my $backup_path = shift;
+
+    # if you specify a template, it must include the temporary
+    # directory if you don't want it to end up in your current
+    # directory:
+    my ($cfh,$cfp) = tempfile() or die "unable to create a temp file, that's bad";
+
+    my @pipelines;
+    my @mb = ( $config->mbuffer_binary, '-q' );
+    if ($config->mbuffer_opts) {
+        push @mb, split(/\s+/,$config->mbuffer_opts);
+    }
+    my @pipes = ({'stage' => 'dump'});
+    if ($dbtype eq 'mysql') {
+        $pipes[0]{'exec'} = [(build_mysql_exec('mysqldump'),$database)];
+    }
+    elsif ($dbtype eq 'postgresql') {
+        my @pg_exec = build_postgresql_exec( $database eq 'all' ? 'pg_dumpall' : 'pg_dump' );
+        if ( $database ne 'all' ) {
+            push(@pg_exec,$database);
+        }
+        $pipes[0]{'exec'} = \@pg_exec;
+        $pipes[0]{'user'} = 'postgres';
+    }
+    elsif ($dbtype eq 'mongodb') {
+        $pipes[0]{'exec'} = [build_mongodb_exec()];
+    }
+    else {
+        my $dmsg = "unknown database type: ${dbtype}";
+        dlog('critical',$dmsg, \%logparams);
+        die $dmsg;
+    }
+
+    my $verify_fifo = join('.',$backup_path,'fifo');
+    my $hash_fifo = join('.',$backup_path,'hash');
+
+    if ($config->rate_limit) {
+        push(@pipes, {
+            'stage' => 'pv',
+            'exec' => [ 'pv', '-L', $config->rate_limit ],
+        });
+    }
+    if ($config->mbuffer) {
+        push(@pipes,
+             {
+                 'stage' => 'mbuffer-dump',
+                 'exec' => \@mb,
+             },
+         );
+    }
+    if (($config->mysql and $config->mysql_verify) or $config->checksum) {
+        my @tees = ('tee');
+        if ($config->mysql and $config->mysql_verify) {
+            push @tees, $verify_fifo;
+        }
+        if ($config->checksum) {
+            push @tees, $hash_fifo;
+        }
+        push(@pipes,
+             {
+                 'stage' => 'tee',
+                 'exec'  => \@tees,
+             },
+         );
+        if ($config->mbuffer) {
+            push(@pipes,
+                 {
+                     'stage' => 'mbuffer-tee',
+                     'exec' => \@mb,
+                 },
+             );
+        }
+    }
+    unless ( $config->compression eq 'none' ) {
+        push(@pipes,{
+            'stage' => 'compress',
+            'exec' => [
+                split(/\s+/,${compressors{$config->compression}{compress}}),
+            ],
+        });
+        if ($config->mbuffer) {
+            push(@pipes,
+                 {
+                     'stage' => 'mbuffer-compress',
+                     'exec' => \@mb,
+                 },
+             );
+        }
+    }
+    push(@pipelines,
+         { output_file => $backup_path,
+           pipes       => \@pipes,
+       });
+    if ($config->mysql_verify) {
+        mkfifo($verify_fifo, 0600) or die "unable to create fifo for verifying mysql dump";
+        my @vpipes;
+        if ($config->mbuffer) {
+            push (@vpipes,
+                  {
+                      'stage' => 'mbuffer-verify',
+                      'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
+                  },
+              );
+        }
+        push(@vpipes,
+             {
+                 'stage' => 'verify-tail', 'exec' => [ 'tail', '-n', '1' ] },
+             { 'stage' => 'verify',
+               'exec'  => [ 'grep', '-q', 'Dump completed' ]
+           },
+         );
+        push(@pipelines,{
+            input_file  => $verify_fifo,
+            output_file => '/dev/null',
+            pipes => \@vpipes,
+        });
+    }
+    if ($config->checksum) {
+        mkfifo($hash_fifo, 0600) or die "unable to create fifo for hashing dump";
+        my @cpipes;
+        if ($config->mbuffer) {
+            push (@cpipes,
+                  {
+                      'stage' => 'mbuffer-checksum',
+                      'exec' => [ 'mbuffer', '-q', split(/\s+/,$config->mbuffer_opts)],
+                  },
+              );
+        }
+        push(@cpipes,
+             { 'stage' => 'checksum', 'exec' => [ $config->checksum_binary ] },
+         );
+        push(@pipelines,{
+            input_file    => $hash_fifo,
+            output_handle => $cfh,
+            pipes         => \@cpipes,
+        });
+    }
+
+    my $start_time = time();
+
+    my $exit_map = pipeline(@pipelines);
+
+    unlink $verify_fifo if -p $verify_fifo;
+    unlink $hash_fifo if -p $hash_fifo;
+
+    $logparams{runtime} = time() - $start_time;
+    $logparams{exit} = 0;
+ PIPELINE:
+    foreach my $line (@pipelines) {
+    PIPE:
+        foreach my $p (@{$$line{pipes}}) {
+        STAGE:
+            my $stage = $$p{stage};
+            if (exists $$exit_map{$stage} and $$exit_map{$stage} != 0) {
+                $logparams{exit} = $$exit_map{$stage};
+                $logparams{failed_stage} = $stage;
+                last PIPELINE;
+            }
+        }
+    }
+    if ( $logparams{exit} == 0 and $config->checksum ) {
+        my $fh;
+        unless(open($fh,'<',$cfp)) {
+            $logparams{errno} = $ERRNO;
+            dlog('error', 'checksum file open failure', \%logparams);
+        }
+        my $line;
+    EOF:
+        while ( ! eof($fh) ) {
+            unless ( defined( $line = readline $fh ) ) {
+                $logparams{errno} = $ERRNO;
+                dlog('error', 'checksum file read error', \%logparams);
+            }
+            last EOF;
+        }
+        if($line and my ($hash) = $line =~ m{\A(.+?)\s+-}xms) {
+            $logparams{$config->checksum_binary} = $hash;
+        }
+        else {
+            dlog('error', 'checksum parse failure', \%logparams);
+        }
+        close $fh;
+    }
+    unlink $cfp if -f $cfp;
+    dlog( ($logparams{exit} == 0 ? 'info' : 'error'), 'dump status', \%logparams );
+    return ($logparams{exit}, $logparams{failed_stage});
+}
+
 sub postgresql_dump {
     my $database = shift;
     my $backup_path = shift;
@@ -1319,11 +1588,10 @@ sub postgresql_dump {
     }
 
     my $start_time = time();
-    my $exit_map = pipeline(
-        \@pipelines,
-        undef,
-        $backup_path,
-    );
+    my $exit_map = pipeline({
+        output_file => $backup_path,
+        pipes => \@pipelines,
+    });
     $logparams{runtime} = time() - $start_time;
     $logparams{exit} = 0;
 
@@ -1578,6 +1846,37 @@ Run this command after all (not each) dumps.
 
 Run this command before all (not each) dumps.
 
+=item B<--mbuffer|--no-mbuffer> C<mbuffer>
+
+Insert mbuffer at various stages in the pipeline.
+
+=item B<--mbuffer_binary|--mbuffer-binary>=I<binary> C<mbuffer_binary>
+
+Execute this when mbuffer is enabled.
+
+Default: mbuffer
+
+=item B<--mbuffer_opts|--mbuffer-opts>=I<opts> C<mbuffer_opts>
+
+Append these options to mbuffer invocations. (ie: -m 1G)
+
+=item B<--rate_limit|--rate-limit>=I<rate> C<mbuffer_opts>
+
+Pass this option to pv -L, that is set the rate limitting factor for
+pv for testing.
+
+=item B<--checksum|--no-checksum> C<checksum>
+
+Write the checksum of the dump to the log file and database.
+
+=item B<--checksum_binary|--checksum-binary> C<checksum_binary>
+
+Pipe dump data to this binary.  Assumed to creat output like, md5sum,
+sha256sum, etc.
+
+Default: sha256sum
+
+
 =back
 
 =head2 LOGGING OPTIONS
@@ -1711,6 +2010,15 @@ Passed to -h on mysql and mysqldump commands.
 =item B<--mysql_extra_option>=I<option> C<mysql_extra_option>
 
 Can be specified multiple times, options passed to mysqldump, if set.
+
+=item B<--mysql_verify|--no-mysql_verify> C<mysql_verify>
+
+Checks for a final line containing the string "Dump Completed"
+
+This is a flawed way to verify the database, but in general if
+mysqldump doens't output this line you can assume something has gone
+wrong.  However, the presence of this line in the output does not
+guarantee that the dump was successful, only that it was "completed."
 
 =back
 

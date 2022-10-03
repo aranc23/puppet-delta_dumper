@@ -1529,8 +1529,8 @@ sub update_status_db {
         dlog('error', "unable to open database file ${DB_FILE}", {db_file => $DB_FILE});
         return;
     }
-
-    $status{join('*', $dbtype, $dbname)} = freeze($value);
+    my $json = JSON->new();
+    $status{join('*', $dbtype, $dbname)} = $json->encode($value);
 
     untie %status;
     unlock_db($db_lock_handle);
@@ -1561,14 +1561,26 @@ sub status_json {
         dlog('error', "unable to open database file ${DB_FILE} for reading", {db_file => $DB_FILE});
         return;
     }
-    my %json;
-    while(my ($k,$v)=each(%status)) {
-        $json{$k}=thaw($v);
-    }
+    my %data;
     my $json = JSON->new->pretty();
-    print $json->encode(\%json);
+ STATUS:
+    while(my ($k,$v)=each(%status)) {
+        eval {
+            $data{$k} = $json->decode($v);
+        }
+        or do {
+            eval {
+                $data{$k} = thaw($v);
+            }
+            or do {
+                dlog('error', "unable to decode string in status database for ${k}", {db_file => $DB_FILE});
+                next STATUS;
+            };
+        };
+    }
     untie %status;
     unlock_db($h);
+    print $json->encode(\%data);
 }
 
 =head1 NAME

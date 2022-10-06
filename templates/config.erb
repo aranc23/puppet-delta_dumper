@@ -12,6 +12,10 @@ key="delta_dumper::#{v}" -%>
 scope[key].each do |s| -%>
 <%= v %> = <%= s %>
 <% end end -%>
+<% if scope[key] and not scope[key].nil? and scope[key].is_a?(Hash)
+scope[key].each do |x,y| -%>
+<%= v %> <%= x %> = <%= y %>
+<% end end -%>
 <% if not scope[key].nil? and (scope[key].is_a?(TrueClass) || scope[key].is_a?(FalseClass)) and ( scope[key] == true or scope[key] == false ) -%>
 <%= v %> = <%= scope[key].to_s %>
 <% end -%>

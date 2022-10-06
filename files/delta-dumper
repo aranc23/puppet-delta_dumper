@@ -92,7 +92,7 @@ for my $dir ($STATE_DIR,$CONFIG_DIR) {
 my $CONFIG_FILE = File::Spec->catfile($CONFIG_DIR, 'config');
 
 # unused, unloved, restore mode!
-my $RESTORE=0;
+my $RESTORE;
 # if true, print the database status and exit
 my $STATUS_JSON;
 # delete these keys from the status database
@@ -615,6 +615,11 @@ sub init_config {
             ARGCOUNT => ARGCOUNT_ONE,
             VALIDATE => '^[0-9]+$',
         },
+        'maxage' => {
+            ARGS     => '=s',
+            ARGCOUNT => ARGCOUNT_ONE,
+            VALIDATE => '^[0-9]+[hdwmy]$',
+        },
         'rsync_binary' => {
             ARGS     => '=s',
             ARGCOUNT => ARGCOUNT_ONE,
@@ -669,6 +674,7 @@ sub main {
   # set up our dispatch destinations:
   $DISPATCHER = create_dispatcher();
 
+  # major modes of operation follow:
   if ( @STATUS_DELETE and scalar @STATUS_DELETE > 0 ) {
       status_delete(@STATUS_DELETE);
       exit;
@@ -676,6 +682,10 @@ sub main {
   if ( basename($PROGRAM_NAME) eq 'check_delta_dumper' or $STATUS_JSON ) {
       status_json();
       exit;
+  }
+
+  if ($RESTORE and -f $RESTORE) {
+      die "unable to restore files (yet)";
   }
 
   ## Starting up:
@@ -798,7 +808,7 @@ sub parse_config {
   GetOptions('config_file|config|config-file=s' => \$CONFIG_FILE,
              'status_json|status-json!'         => \$STATUS_JSON,
              'status_delete|status-delete=s@'   => \@STATUS_DELETE,
-             'restore'                          => \$RESTORE,
+             'restore=s'                        => \$RESTORE,
             );
   # read the config file
   if ( -f $CONFIG_FILE ) {
@@ -1025,6 +1035,7 @@ sub timestamp_sort {
 }
 
 sub find_most_recent_dump {
+    local %logparams = %logparams;
     my $databasetype = shift;
     my $databasename = shift;
     unless(exists $dump_db{$databasetype}{$databasename}) {
@@ -1033,7 +1044,39 @@ sub find_most_recent_dump {
     my @vals = values(%{$dump_db{$databasetype}{$databasename}});
     @vals = grep {$$_{full}} @vals;
     @vals = sort timestamp_sort @vals;
+    my $dump_stamp = $vals[-1]{ timestamp }; # my favorite musical genre
+    my $maxage_seconds = $config->maxage ? parse_time_spec( $config->maxage ) : undef;
+    if ( $config->maxage
+         and $maxage_seconds
+         and $maxage_seconds > 0
+         and ( $dump_stamp + $maxage_seconds ) < time() ) {
+        dlog('info',
+             "backup age",
+             \%logparams,
+             {   maxage         => $config->maxage,
+                 maxage_seconds => $maxage_seconds,
+                 dump_timestamp => $dump_stamp,
+             }
+         );
+        return;    # fail to find because of age
+    }
     return $vals[-1];
+}
+
+sub parse_time_spec {
+    my $spec = shift @_;
+    my ($t,$p);
+    unless( ($t,$p) = $spec =~ m{ \A (\d+) \s* ([hdwmy]) }xms ) {
+        dlog('error', "parse_time_spec failure", { spec => $spec });
+        return;
+    }
+    return $t * ( $p eq 'h' ? (3600)
+                  : $p eq 'd' ? ( 3600 * 24 )
+                  : $p eq 'w' ? ( 3600 * 24 * 7 )
+                  : $p eq 'm' ? ( 3600 * 24 * 30 )
+                  : ( 3600 * 24 * 365 )
+                  );
+    # the last option must be y
 }
 
 sub scan_existing {
@@ -2161,6 +2204,21 @@ Default: 1
 
 When the month day matches this a monthly backup will be created in
 addition to the daily.
+
+=item B<--maxage>=I<agespec> C<maxage>
+
+When using xdelta compression, if the newest full backup is older than
+this age specification create a new full backup instead of using
+xdelta.
+
+The specification is an integer followed by one of h, d, w, m, or y.
+
+These correspond with hours, days, weeks, months, and years. Months
+are considered to be 30 days long and years are 365 days.
+
+So, if you want a new full dump every 2 weeks:
+
+maxage = 2w
 
 =back
 

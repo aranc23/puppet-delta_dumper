@@ -11,7 +11,7 @@ use File::Basename;
 use POSIX;
 use Fcntl qw(:DEFAULT :flock); # import LOCK_* constants
 use File::Temp qw/ tempfile /;
-use Env qw( HOME HOSTNAME SHORTNAME );
+use Env qw( HOME HOSTNAME SHORTNAME DEBUG );
 use Pod::Usage;
 eval { use Time::HiRes qw( time ); };
 use File::Spec;
@@ -40,35 +40,6 @@ my $APP_NAME = 'delta-dumper';
 my $USER
     = $ENV{LOGNAME} || $ENV{USERNAME} || $ENV{USER} || scalar( getpwuid($<) );
 
-# define what programs to use for what compression setting:
-my %compressors = (
-    'gzip' => {
-        'compress'   => 'gzip -c --rsyncable',
-        'uncompress' => 'gzip -c -d',
-        'extension'  => 'gz',
-    },
-    'bzip2' => {
-        'compress'   => 'bzip2 -c',
-        'uncompress' => 'bzcat',
-        'extension'  => 'bz2'
-    },
-    'xz' => {
-        'compress'   => 'xz -T0 --stdout',
-        'uncompress' => 'xzcat -T0',
-        'extension'  => 'xz'
-    },
-    'zstd' => {
-        'compress'   => 'zstd -T0 --stdout',
-        'uncompress' => 'zstd -T0 --uncompress --stdout',
-        'extension'  => 'zst',
-    },
-    'compress' => {
-        'compress'   => 'compress -c',
-        'uncompress' => 'uncompress -c',
-        'extension'  => 'Z',
-    }
-);
-
 # translate lowercase database types to funky case
 my %databasetype_case = (
     'mysql'      => 'MySQL',
@@ -78,6 +49,9 @@ my %databasetype_case = (
 
 # list of readonly periods:
 my @periods = qw( daily weekly monthly );
+
+# list of readonly known database types:
+my @dbtypes = qw( mysql postgresql mongodb );
 
 # global app configuration
 my $config;
@@ -136,6 +110,10 @@ my $DISPATCHER;
 
 # create a logparams for logging, intended to be localized:
 our %logparams=();
+
+# data structure for finding the most recent dumps and protecting used
+# ones:
+my %dump_db;
 
 # just ensure hostname is set to something
 unless($HOSTNAME and length $HOSTNAME > 0) {
@@ -448,23 +426,56 @@ sub init_config {
             DEFAULT  => 'gzip',
             ARGCOUNT => ARGCOUNT_ONE,
             ARGS     => '=s',
-            VALIDATE => '^(' . join( '|', keys(%compressors), 'custom', 'none' ). ')$',
         },
-        'compress' => {
+        'secondary_compression' => {
+            DEFAULT  => 'none',
             ARGCOUNT => ARGCOUNT_ONE,
             ARGS     => '=s',
         },
-        'uncompress' => {
-            ARGCOUNT => ARGCOUNT_ONE,
-            ARGS     => '=s',
+        'compressor_compress' => {
+            ARGS    => '=s%',
+            ALIAS   => 'compressor-compress',
+            DEFAULT => {
+                'gzip'     => 'gzip -c',
+                'bzip2'    => 'bzip2 -c',
+                'xz'       => 'xz --stdout',
+                'zstd'     => 'zstd --stdout',
+                'compress' => 'compress -c',
+                'none'     => 'cat',
+                'xdelta'   => 'xdelta -e',
+            },
+            ARGCOUNT => ARGCOUNT_HASH,
         },
-        'extension' => {
-            ARGCOUNT => ARGCOUNT_ONE,
-            ARGS     => '=s',
+        'compressor_uncompress|compressor-uncompress=s%' => {
+            DEFAULT => {
+                'gzip'     => 'gzip -d -c',
+                'bzcat'    => 'bzcat',
+                'xz'       => 'xzcat',
+                'zstd'     => 'zstd --uncompress --stdout',
+                'compress' => 'uncompress -c',
+                'none'     => 'cat',
+                'xdelta'   => 'xdelta -d',
+            },
+        },
+        'compressor_suffix|compressor-suffix=s%' => {
+            DEFAULT => {
+                'gzip' => 'gz',
+                'bzip2' => 'bz2',
+                'xz' => 'xz',
+                'zstd' => 'zst',
+                'compress' => 'Z',
+                # 'none' => 'cat', # leave undefined
+                'xdelta' => 'vcdiff',
+            },
         },
         'backup_location=s' => {
             DEFAULT => "/var/${APP_NAME}/backups",
             VALIDATE => '^\/.+',    # require an absolute path?
+        },
+        'old_backup_location' => {
+            ALIAS    => 'old-backup-location',
+            ARGS     => '=s@',
+            ARGCOUNT => ARGCOUNT_LIST,
         },
         'tmpdir' => {
             ALIAS    => 'tmp_dir|tempdir|temp_dir',
@@ -679,6 +690,8 @@ sub main {
 
   sanity_check_config();
 
+  scan_existing();
+
   # obtain the global lock, or die trying
   my $GLOBAL_LOCK = lock_pid_file($APP_NAME);
   unless ( $GLOBAL_LOCK ) {
@@ -757,9 +770,9 @@ sub system_runner {
                  'LOG_LOCATION'    => $config->log_location,
                  'TMPDIR'          => $config->tmpdir,
                  'COMPRESSION'     => $config->compression,
-                 'COMPRESS'        => $compressors{compress},
-                 'UNCOMPRESS'      => $compressors{uncompress},
-                 'SUFFIX'          => $compressors{suffix},
+                 'COMPRESS'        => $config->compressor_compress->{$config->compression},
+                 'UNCOMPRESS'      => $config->compressor_uncompress->{$config->compression},
+                 'SUFFIX'          => $config->compressor_suffix->{$config->compression},
              );
     while ( my ($k,$v) = each %pairs) {
         $ENV{join('_',$prefix, uc $k)} = $v;
@@ -833,9 +846,20 @@ sub perform_backup {
     my $current_dir = File::Spec->catfile($config->backup_location,'current');
     # suffix or not:
     my @suffix = ( 'sql' ) ;
-    unless ($config->compression eq 'none' ) {
-        push @suffix, $compressors{$config->compression}{'extension'};
+    # this is a hash from the dump_db with keys, timestamp, path, full, and period
+    my $full_dump = find_most_recent_dump($databasetype,$database);
+
+    my $effective_compresssion_method
+        = $config->compression eq 'xdelta'
+        ? ($full_dump
+           ? 'xdelta' # ask and ye shall receive
+           : $config->secondary_compression)
+        : $config->compression;
+    if ( defined $config->compressor_suffix->{$effective_compresssion_method} ) {
+        push @suffix, $config->compressor_suffix->{$effective_compresssion_method};
     }
+    $logparams{compression} = $effective_compresssion_method;
+
     # the components of the file name to eventually create:
     my @file_parts = ( $databasetype, $database );
     my $file_name = backup_file_name_builder(@file_parts,\@suffix);
@@ -850,52 +874,60 @@ sub perform_backup {
     my ($_of,$output_path) = tempfile("${file_name}.XXXXXXXX",
                                       DIR => $config->tmpdir ? $config->tmpdir : $current_dir);
     # this timestamp should be used in the creation of the symlinks:
-    my $backup_timestamp = strftime "%FT%T",  localtime($start_time);
-    my $file_name_timestamp = backup_file_name_builder(@file_parts,$backup_timestamp,\@suffix);
+    my $backup_timestamp_format = strftime "%FT%T",  localtime($start_time);
+    my $file_name_timestamp
+        = ( $effective_compresssion_method eq 'xdelta' )
+        ? backup_file_name_builder(@file_parts,
+                                   strftime('%FT%T', localtime($$full_dump{timestamp})),
+                                   strftime('%FT%T', localtime($start_time)),
+                                   \@suffix)
+        : backup_file_name_builder(@file_parts,
+                                   strftime('%FT%T', localtime($start_time)),
+                                   \@suffix);
 
-    # could probably use a function reference here:
-    my $return_value;
-    my $stage;
-    ($return_value,$stage) = generic_dump($databasetype,$database,$output_path);
+    my ($return_value,$stage)
+        = generic_dump($databasetype,
+                       $database,
+                       $effective_compresssion_method,
+                       $output_path,
+                       $full_dump);
 
     if (defined $return_value and $return_value == 0) {
-      # this is the relative link path to the current backup in current:
+      # this is the relative link path to the most recent backup in current:
       my $relative_name = File::Spec->catfile('..','current',$file_name);
 
       if($config->localcow and -f $backup_path) {
-        local %logparams = %logparams; # is this a copy???
-        my ($_tf,$tf_path) = tempfile("${file_name}.XXXXXXXX",
-                                      DIR => $config->backup_location);
-        $logparams{temp_file} = $tf_path;
-        unless ( rsync($backup_path,$tf_path) ) {
+        local %logparams = %logparams;
+        $logparams{temp_file} = join('.',$file_name,'TEMP');
+
+        unless ( rsync($backup_path, $logparams{temp_file}) ) {
             dlog('error', "unable to rsync from backup to location to temp file", \%logparams);
-            unlink $tf_path;
+            unlink $logparams{temp_file};
             update_status_db($databasetype, $database, { exit => 1,
                                                          stage => 'rsync',
                                                          start_time => $start_time, });
             return;
         }
-        link_symlinks(backup_file_name_builder(@file_parts).'*',
-                      $relative_name,
-                      $tf_path);
-        unlink $tf_path;
+        link_symlinks( $databasetype, $database );
+        unlink $logparams{temp_file};
       }
       else {
-        # look in each directory for symlinks to the current file:
-          link_symlinks(backup_file_name_builder(@file_parts).'*',
-                        $relative_name,
-                        $backup_path);
+          # look in each directory for symlinks to the current file:
+          link_symlinks($databasetype,$database);
       }
 
       # remove the old output file, now that the hard links will
       # preserve it:
-      foreach my $alt (path_alternates($backup_path)) {
+      foreach my $alt (@alternates) {
           # delete all the current files for this backup, unless it's
           # the one we intend to write in this pass and localcow is
           # enabled:
           next unless -f $alt;
           next if ( $config->localcow and $backup_path eq $alt );
-          unlink $alt;
+          dlog('debug', "unlink alternate", \%logparams, {alternate_file => $alt});
+          unless(unlink $alt) {
+              dlog('error', "unlink alternate", \%logparams, {errno => $ERRNO, alternate_file => $alt});
+          }
       }
 
       # rename our temp file into the file we're trying to create:
@@ -961,7 +993,17 @@ sub perform_backup {
       dlog('notice',
            "backup status",
            \%logparams);
-      clean_old_dumps($config->backup_location, $databasetype, $database);
+      $dump_db{$databasetype}{$database}{$start_time} = {
+          timestamp => $start_time,
+          path      => File::Spec->catfile(
+              $config->backup_location, 'daily', $file_name_timestamp
+          ),
+          period    => 'daily',
+          full      => $effective_compresssion_method eq 'xdelta' ? 0 : 1,
+      };
+      $dump_db{$databasetype}{$database}{$start_time}{full_timestamp} = int($$full_dump{timestamp}) if $full_dump;
+      print Dumper \%dump_db if $DEBUG;
+      clean_old_dumps($databasetype, $database);
       update_status_db($databasetype, $database, { exit => 0,
                                                    start_time => $start_time, });
       return $start_time;
@@ -978,67 +1020,198 @@ sub perform_backup {
   return;
 }
 
+sub timestamp_sort {
+    return int($$a{timestamp}) <=> int($$b{timestamp});
+}
+
+sub find_most_recent_dump {
+    my $databasetype = shift;
+    my $databasename = shift;
+    unless(exists $dump_db{$databasetype}{$databasename}) {
+        return; # fail to find
+    }
+    my @vals = values(%{$dump_db{$databasetype}{$databasename}});
+    @vals = grep {$$_{full}} @vals;
+    @vals = sort timestamp_sort @vals;
+    return $vals[-1];
+}
+
+sub scan_existing {
+    local %logparams = %logparams;
+    # pattern for finding delta-dumper files in per-period directories:
+    my @locations = ($config->backup_location);
+    if ( $config->old_backup_location and ( scalar $config->old_backup_location > 0 ) ) {
+        push(@locations, @{$config->old_backup_location});
+    }
+    my $delta_pat = File::Spec->catfile('{'.join(',',@locations).'}',
+                                        '{'.join(',',@periods).'}',
+                                        '{'.join(',',@dbtypes,'postgres').'}-*sql*');
+    # pattern for finding files created by csg-db-backup.pl, not using
+    # per-period directories:
+    my $csg_db_backup_pat = File::Spec->catfile('{'.join(',',@locations).'}',
+                                                '*{'.join(',',@periods).'}*sql*');
+    my $d_q = '('.join('|',@dbtypes).')';
+    my $d_p = '('.join('|',@periods).')';
+
+ FILE:
+    foreach my $file (glob($delta_pat)) {
+        # -f seems to be true on symlinks that point to files:
+        next unless -f $file;
+        $logparams{'file'} = $file;
+        my $full_timestamp;
+        my $timestamp;
+        # match files created by the old and new versions of pgsql:
+        # postgres-all-databases.sql.2022-08-28.gz
+        # postgres-all-databases.sql.2022-09-04-05.49.gz
+        my ($type, $db, $o, $i, $year, $month, $day, $hour, $minute);
+        if ( ($db, $year, $month, $day, $hour, $minute ) = basename($file)
+             =~ m{\Apostgres [.-] (.+) [.-] sql [.-] (\d\d\d\d) [.-] (\d\d) [.-] (\d\d) [.-] (\d\d) [.-] (\d\d)}xms ) {
+            $db = 'all' if $db eq 'all-databases';
+            $type = 'postgresql';
+            $timestamp = mktime(0,
+                                $minute,
+                                $hour,
+                                $day,
+                                ($month - 1),
+                                ($year - 1900)
+                            );
+        }
+        elsif ( ($db, $year, $month, $day ) = basename($file)
+                =~ m{\Apostgres [.-] (.+) [.-] sql [.-] (\d\d\d\d) [.-] (\d\d) [.-] (\d\d)}xms ) {
+            $db = 'all' if $db eq 'all-databases';
+            $type = 'postgresql';
+            $timestamp = mktime(0,
+                                0,
+                                0,
+                                $day,
+                                ($month - 1),
+                                ($year - 1900)
+                            );
+        }
+        elsif ( ($type, $db, $o, $i) = basename($file) =~ m{\A${d_q} [.-] (.+) [.-] (\d\d\d\d . .+) [.-] (\d\d\d\d . .+) [.] sql [.] vcdiff}xms ) {
+            # files like: daily/mysql-enchantress-2022-10-04T08:50:45.sql.zst
+            # should probably inlude more variations of the timestamp?
+            $full_timestamp = str2time($o);
+            $timestamp = str2time($i);
+        }
+        elsif ( ($type, $db, $i) = basename($file) =~ m{\A${d_q} [.-] (.+) [.-] (\d\d\d\d . .+) [.] sql}xms ) {
+            # files like: daily/mysql-enchantress-2022-10-04T08:50:45.sql.zst
+            # should probably inlude more variations of the timestamp?
+            $timestamp = str2time($i);
+        }
+        else {
+            dlog( 'error', "unable to parse time stamp from file", \%logparams );
+            next FILE;
+        }
+        $dump_db{$type}{$db}{$timestamp} =
+        {
+            path      => $file,
+            timestamp => $timestamp,
+            period    => basename(dirname($file)),
+            full      => $file =~ m{[.] vcdiff}xms ? 0 : 1,
+        };
+        $dump_db{$type}{$db}{$timestamp}{full_timestamp} = $full_timestamp if $full_timestamp;
+    }
+ FILE:
+    foreach my $file (glob($csg_db_backup_pat)) {
+        # -f seems to be true on symlinks that point to files:
+        next unless -f $file;
+        $logparams{'file'} = $file;
+        my $timestamp;
+        # files like omim_db.daily.sql.2022-09-26-21.12.gz in the top
+        # level directory:
+        if ( my ($db, $period, $year,$month,$day,$hour,$minute) = basename($file) =~ m{\A(.+) [.-] ${d_p} [.-] sql [.-] (\d\d\d\d) [.-] (\d\d) [.-] (\d\d) [.-] (\d\d) [.-] (\d\d)}xms ) {
+            $timestamp = mktime(0,
+                                $minute,
+                                $hour,
+                                $day,
+                                ($month - 1),
+                                ($year - 1900)
+                            );
+            $dump_db{mysql}{$db}{$timestamp} =
+            {
+                path      => $file,
+                timestamp => $timestamp,
+                period    => $period,
+                full      => 1,
+            };
+        }
+        else {
+            dlog( 'error', "unable to parse time stamp from file", \%logparams );
+            next FILE;
+        }
+    }
+    print Dumper \%dump_db if $DEBUG;
+    # while(my ($t,$v) = each(%dump_db)) {
+    #     while(my ($d,$b) = each(%{$v})) {
+    #         while(my ($p,$h) = each(%{$b})) {
+    #             printf("%s\t%s\t%s\t%s\t%s\n",
+    #                    $t,
+    #                    $d,
+    #                    $p,
+    #                    $$h{path},
+    #                    strftime("%FT%T%z",localtime($$h{timestamp})));
+    #         }
+    #     }
+    # }
+}
+
 # use daily/weekly/monthly values to remove files
 sub clean_old_dumps {
-    my $path = shift;
     my $databasetype = shift;
     my $databasename = shift;
     local %logparams = %logparams;
-
+    # we shouldn't calculate this on each call, but here we are:
+    my %period_times;
+    unless ( exists $dump_db{$databasetype}
+             and exists $dump_db{$databasetype}{$databasename} ) {
+        return;
+    }
  PERIOD:
     foreach my $period (@periods) {
-        $logparams{'period'} = $period;
-        $logparams{'dir'} = File::Spec->catfile($path,$period);
 
         my $n = $config->get($period) ? $config->get($period) : 0;
         $n = $n * 7 if $period eq 'weekly';
         $n = $n * 31 if $period eq 'monthly';
         $n *= 86400; # convert to seconds
-
-    FILE:
-        foreach my $file (glob(File::Spec->catfile($logparams{'dir'},"${databasetype}-${databasename}*")),
-                          glob(File::Spec->catfile($path,            "${databasename}.${period}.sql.*")),
-                      ) {
-            next if -l $file; # explicitly skip symlinks
-            next unless -f $file; # do not act on non-regular files
-            $logparams{'file'} = $file;
-            my $timestamp;
-
-            if ( my ($i) = basename($file) =~ m{(\d\d\d\d . \d\d . \d\d T \d\d . \d\d . \d\d)}xms ) {
-                $timestamp = str2time($i);
-            }
-            elsif ( my ($year,$month,$day,$hour,$minute) = basename($file) =~ m{(\d\d\d\d) . (\d\d) . (\d\d) . (\d\d) . (\d\d)}xms ) {
-                $timestamp = mktime(0,
-                                    $minute,
-                                    $hour,
-                                    $day,
-                                    ($month - 1),
-                                    ($year - 1900)
-                                );
+        $period_times{$period} = $n;
+    }
+ FILE:
+    foreach my $fhash (values(%{$dump_db{$databasetype}{$databasename}})) {
+        local %logparams = %logparams;
+        next if -l $$fhash{path}; # explicitly skip symlinks
+        next unless -f $$fhash{path}; # do not act on non-regular files
+        next unless unused_dump($$fhash{timestamp}, values(%{$dump_db{$databasetype}{$databasename}}));
+        $logparams{'period'} = $$fhash{period};
+        $logparams{'file'} = $$fhash{path};
+        $logparams{file_timestamp} = $$fhash{timestamp};
+        $logparams{file_datetime} = localtime($$fhash{timestamp});
+        if( (time() - $$fhash{timestamp}) > $period_times{$$fhash{period}} ) {
+            if( unlink $$fhash{path} ) {
+                dlog('info','unlink dump', \%logparams );
             }
             else {
-                dlog( 'error', "unable to parse time stamp from file", \%logparams );
-                next FILE;
-            }
-            $logparams{file_timestamp} = $timestamp;
-            $logparams{file_datetime} = localtime($timestamp);
-            if( (time() - $timestamp) > $n ) {
-                if( unlink $file ) {
-                    dlog('info','unlink dump', \%logparams );
-                }
-                else {
-                    dlog('error','unlink dump', \%logparams );
-                }
+                dlog('error','unlink dump', \%logparams );
             }
         }
     }
 }
 
+sub unused_dump {
+    my $timestamp = shift;
+    foreach my $fh (@_) {
+        print Dumper $fh if $DEBUG;
+        if ( defined $$fh{full_timestamp} and $$fh{full_timestamp} eq $timestamp ) {
+            return;
+        }
+    }
+    return 1;
+}
+
 sub path_alternates {
     my $p = shift;
     my @suffixes
-        = map { '.' . $compressors{$_}{extension}; } ( keys(%compressors) );
-
+        = map { '.' . $_; } ( values(%{$config->compressor_suffix}) );
     # create a list of possible alternative backup paths (if compression changes)
     my @alternates = map {
         my ( $f, $d, $s ) = fileparse( $p, @suffixes );
@@ -1211,12 +1384,24 @@ sub split_fork_exec {
     }
 }
 
+sub find_compressor {
+    my $file = shift;
+    while(my ($method, $suffix) = each(%{$config->compressor_suffix})) {
+        if ( $file =~ m{ [.] ${suffix} $}xms ){
+            return $method;
+        }
+    }
+    return;
+}
+
 sub generic_dump {
     local %logparams = %logparams;
     # pass the type, database, and path? or also the primary dump exec command?
     my $dbtype = shift;
     my $database = shift;
+    my $compression = shift;
     my $backup_path = shift;
+    my $full_dump = shift; # only used if xdelta is in effect
 
     # if you specify a template, it must include the temporary
     # directory if you don't want it to end up in your current
@@ -1249,9 +1434,11 @@ sub generic_dump {
         die $dmsg;
     }
 
-    my $verify_fifo = join('.',$backup_path,'fifo');
-    my $hash_fifo = join('.',$backup_path,'hash');
-
+    my %fifos = (
+        verify => join('.',$backup_path,'fifo'),
+        hash => join('.',$backup_path,'hash'),
+        delta => join('.',$backup_path,'delta'),
+    );
     if ($config->rate_limit) {
         push(@pipes, {
             'stage' => 'pv',
@@ -1269,10 +1456,10 @@ sub generic_dump {
     if (($config->mysql and $config->mysql_verify) or $config->checksum) {
         my @tees = ('tee');
         if ($config->mysql and $config->mysql_verify) {
-            push @tees, $verify_fifo;
+            push @tees, $fifos{verify};
         }
         if ($config->checksum) {
-            push @tees, $hash_fifo;
+            push @tees, $fifos{hash};
         }
         push(@pipes,
              {
@@ -1289,11 +1476,48 @@ sub generic_dump {
              );
         }
     }
-    unless ( $config->compression eq 'none' ) {
+    # store this here and now but put it at the end of the pipelines
+    my $decomp_hash;
+    # here we need to decide if we should create a diff or not
+    if ($compression eq 'xdelta') {
+        $logparams{xdelta_source} = $$full_dump{path};
+        my @delta_exec = split(/\s+/,$config->compressor_compress->{$compression});
+        if (my $c = find_compressor($$full_dump{path}) ) {
+            warn "use this compressor/uncompressor: ${c}" if $DEBUG;
+            push @delta_exec, '-s', $fifos{delta};
+            mkfifo($fifos{delta}, 0600) or die "unable to create fifo for decompressing";
+            $decomp_hash = {
+                input_file => $$full_dump{path},
+                output_file => $fifos{delta},
+                pipes => [
+                    { stage => 'uncompress',
+                      exec => [split(/\s+/,$config->compressor_uncompress->{$c})],
+                  }],
+            };
+        }
+        else {
+            # here we allow xdelta direct access to the file
+            push @delta_exec, '-s', $$full_dump{path};
+        }
+        push(@pipes,{
+            'stage' => 'xdelta',
+            'exec'  => \@delta_exec,
+        });
+        if ($config->mbuffer) {
+            push(@pipes,
+                 {
+                     'stage' => 'mbuffer-xdelta',
+                     'exec' => \@mb,
+                 },
+             );
+        }
+        #delete $dump_db{$dbtype}->{$database}->{$$full_dump{timestamp}};
+    }
+    elsif ( $compression ne 'none' ) {
         push(@pipes,{
             'stage' => 'compress',
             'exec' => [
-                split(/\s+/,${compressors{$config->compression}{compress}}),
+                split(/\s+/,$config->compressor_compress->{$compression})
             ],
         });
         if ($config->mbuffer) {
@@ -1310,7 +1534,7 @@ sub generic_dump {
            pipes       => \@pipes,
        });
     if ($config->mysql_verify) {
-        mkfifo($verify_fifo, 0600) or die "unable to create fifo for verifying mysql dump";
+        mkfifo($fifos{verify}, 0600) or die "unable to create fifo for verifying mysql dump";
         my @vpipes;
         if ($config->mbuffer) {
             push (@vpipes,
@@ -1328,13 +1552,13 @@ sub generic_dump {
            },
          );
         push(@pipelines,{
-            input_file  => $verify_fifo,
+            input_file  => $fifos{verify},
             output_file => '/dev/null',
             pipes => \@vpipes,
         });
     }
     if ($config->checksum) {
-        mkfifo($hash_fifo, 0600) or die "unable to create fifo for hashing dump";
+        mkfifo($fifos{hash}, 0600) or die "unable to create fifo for hashing dump";
         my @cpipes;
         if ($config->mbuffer) {
             push (@cpipes,
@@ -1348,18 +1572,22 @@ sub generic_dump {
              { 'stage' => 'checksum', 'exec' => [ $config->checksum_binary ] },
          );
         push(@pipelines,{
-            input_file    => $hash_fifo,
+            input_file    => $fifos{hash},
             output_handle => $cfh,
             pipes         => \@cpipes,
         });
+    }
+    if ($decomp_hash) {
+        push @pipelines, $decomp_hash;
     }
 
     my $start_time = time();
 
     my $exit_map = pipeline(@pipelines);
 
-    unlink $verify_fifo if -p $verify_fifo;
-    unlink $hash_fifo if -p $hash_fifo;
+    foreach my $f (values(%fifos)) {
+        unlink $f if -p $f;
+    }
 
     $logparams{runtime} = time() - $start_time;
     $logparams{exit} = 0;
@@ -1424,53 +1652,52 @@ sub build_postgresql_exec {
 
 
 sub sanity_check_config {
-  unless ($config->mysql or $config->postgresql) {
-    my $emsg='neither mysql nor postgresql was specified, nothing to dump!';
+  unless ($config->mysql or $config->postgresql or $config->mongodb) {
+    my $emsg='neither mysql nor postgresql not mongodb was specified, nothing to dump!';
     dlog('error',$emsg,{});
     die $emsg;
   }
-  if ($config->compression eq 'custom') {
-    $compressors{'custom'} = {};
-    foreach my $p (qw( compress uncompress extension )) {
-      if ($config->get($p)) {
-        $compressors{'custom'}{$p} = $config->get($p);
-      }
-      else {
-        dlog('error',"when using custom compression, you must specify ${p} parameter");
-        die "when using custom compression, you must specify ${p} parameter";
-      }
-    }
-  }
 }
 
+# turn symlinks in per-period directories into hardlinks to the actual
+# file, because the original will go away
 sub link_symlinks {
-  my $pat = shift;
-  my $relative_name = shift;
-  my $backup_path = shift;
-  my @alternates = path_alternates($relative_name);
-  foreach my $p (@periods) {
-    my $ddir = File::Spec->catfile($config->backup_location,$p);
-    foreach my $dbf (glob(File::Spec->catfile($ddir,$pat))) {
-      # if we find a relative link, turn it into a hard link before the file goes away:
-      if (-l $dbf and string_any(readlink($dbf),@alternates)) {
+    local %logparams = %logparams;
+    my $dbtype        = shift;
+    my $dbname        = shift;
+    return unless defined $dump_db{$dbtype}{$dbname};
+    foreach my $dump (values(%{$dump_db{$dbtype}{$dbname}})) {
+        next unless -l $$dump{path}; # skip the non-links
+        print Dumper $dump if $DEBUG;
+        my $target = readlink($$dump{path});
+        if (-f join('.',$target,'TEMP')) {
+            $target =  join('.',$target,'TEMP');
+        }
+        $logparams{dump_path}     = $$dump{path};
+        $logparams{target}        = $target;
+
         # remove this link whether the target exists or not, if
         # the target of a link is missing it's useless anyway:
-        unlink($dbf)
-            or dlog('error', "unable to unlink ${dbf}", \%logparams);
-        # create a hard link to a path that's about to disappear:
-        if ( -f $backup_path ) {
-            if ( link($backup_path, $dbf) ) {
-                dlog('debug', "created link ${backup_path} <- ${dbf}", \%logparams);
-            }
-            else {
-                local %logparams = %logparams;
-                $logparams{errno} = $ERRNO;
-                dlog('error', "unable to link ${backup_path} <- ${dbf}", \%logparams);
-            }
+        my $oldwd = POSIX::getcwd();
+        chdir dirname($$dump{path}) or die "unable to chdir to ${$$dump{path}}";
+        if ( unlink($$dump{path}) ) {
+            dlog( 'debug', "unlink symlink", \%logparams );
         }
-      }
+        else {
+            dlog( 'error', 'unlink symlink', \%logparams, { errno => $ERRNO } );
+        }
+        # create a hard link to a path that's about to disappear:
+        if ( link( $target, $$dump{path} ) ) {
+            dlog( 'debug', "link symlink", \%logparams );
+        }
+        else {
+            dlog(
+                'error', "link symlink",
+                \%logparams, { errno => $ERRNO }
+            );
+        }
+        chdir($oldwd) or die "unable to chdir to ${oldwd}";
     }
-  }
 }
 
 sub rsync {
@@ -1522,6 +1749,9 @@ sub unlock_db {
 sub update_status_db {
     my ($dbtype, $dbname, $value) = @_;
 
+    if ( defined $$value{start_time} ) {
+        $$value{start_time} = strftime("%FT%T%z", localtime($$value{start_time}));
+    }
     my $db_lock_handle = lock_db();
 
     my %status;
@@ -1630,6 +1860,18 @@ Perform (or don't) postgresql database dumps.
 Default: false
 
 Perform (or don't) mongodb database dumps.
+
+=item B<--backup_location>=I<dir> C<backup_location>
+
+This is where the final backups will end up, in sub-directories named
+weekly, current, etc.
+
+=item B<--old_backup_location>=I<dir> C<old_backup_location>
+
+Look here for backups created previously by delta-dumper,
+csg-db-backup.pl, and pgsql scripts in these directories so
+delta-dumper can clean up from old programs or old dumps stored in old
+locations.
 
 =item B<--tmpdir>=I<dir> C<tmpdir>
 
@@ -1752,27 +1994,14 @@ Use pre-configured compression commands, gzip, bzip2, xz, and zstd.
 Also, C<none> is accepted along with C<custom> which requires setting
 the compress, uncompress, and suffix configuration items.
 
-=item B<--compress> C<compress> (String)
+=item C<compressor_compress>
+=item C<compressor_uncompress>
+=item C<compressor_suffix>
 
-Compress command to use when compression is set to custom.  Must read
-from a file and write to stdout.
-
-IE: C<gzip --stdout>
-
-=item B<--uncompress> C<uncompress> (String)
-
-Uncompress command to use when compression is set to custom.  Must read
-from a file and write to stdout.
-
-IE: C<gzcat>
-
-=item B<--suffix|--extension> C<extension> (String)
-
-Suffix to use when creating files when compression is set to custom.
-Must read from a file and write to stdout. Do not specify the period
-before the suffix.
-
-IE: C<gz>
+[compressor]
+compress gzip = gzip -c --rsyncable
+uncompress gzip = gzcat
+extension gzip = gz
 
 =back
 

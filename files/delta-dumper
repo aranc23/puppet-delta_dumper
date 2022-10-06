@@ -1004,14 +1004,14 @@ sub perform_backup {
            "backup status",
            \%logparams);
       $dump_db{$databasetype}{$database}{$start_time} = {
-          timestamp => $start_time,
-          path      => File::Spec->catfile(
+          timestamp      => $start_time,
+          path           => File::Spec->catfile(
               $config->backup_location, 'daily', $file_name_timestamp
           ),
-          period    => 'daily',
-          full      => $effective_compresssion_method eq 'xdelta' ? 0 : 1,
+          period         => 'daily',
+          full           => $effective_compresssion_method eq 'xdelta' ? 0 : 1,
+          full_timestamp => $effective_compresssion_method eq 'xdelta' ? $$full_dump{timestamp} : undef,
       };
-      $dump_db{$databasetype}{$database}{$start_time}{full_timestamp} = int($$full_dump{timestamp}) if $full_dump;
       print Dumper \%dump_db if $DEBUG;
       clean_old_dumps($databasetype, $database);
       update_status_db($databasetype, $database, { exit => 0,

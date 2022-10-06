@@ -798,7 +798,7 @@ sub system_runner {
         dlog( 'error', $tag, \%logparams );
         return;
     }
-    dlog( 'debug', $tag, \%logparams );
+    dlog( 'info', $tag, \%logparams );
     return 1;
 }
 
@@ -1576,7 +1576,7 @@ sub generic_dump {
          { output_file => $backup_path,
            pipes       => \@pipes,
        });
-    if ($config->mysql_verify) {
+    if ($config->mysql and $config->mysql_verify) {
         mkfifo($fifos{verify}, 0600) or die "unable to create fifo for verifying mysql dump";
         my @vpipes;
         if ($config->mbuffer) {

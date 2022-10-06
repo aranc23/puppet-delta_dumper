@@ -17,6 +17,6 @@ scope[key].each do |x,y| -%>
 <%= v %> <%= x %> = <%= y %>
 <% end end -%>
 <% if not scope[key].nil? and (scope[key].is_a?(TrueClass) || scope[key].is_a?(FalseClass)) and ( scope[key] == true or scope[key] == false ) -%>
-<%= v %> = <%= scope[key].to_s %>
+<%= v %> = <% if scope[key] == true %>On<% else %>Off<% end %>
 <% end -%>
 <% end -%>

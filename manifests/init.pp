@@ -98,6 +98,7 @@ class delta_dumper
   Optional[Integer] $monthly = undef,
   Optional[Enum['Sun','Mon','Tue','Wed','Thu','Fri','Sat']] $week_start = undef,
   Optional[Integer] $month_start = undef,
+  Optional[String] $maxage = undef,
   Optional[Stdlib::Absolutepath] $rsync_binary = undef,
   Optional[Array[String]] $rsync_options = undef,
   Optional[String] $prerun = undef,

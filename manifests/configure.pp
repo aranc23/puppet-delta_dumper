@@ -51,6 +51,7 @@ class delta_dumper::configure {
     'monthly',
     'week_start',
     'month_start',
+    'maxage',
     'rsync_binary',
     'rsync_options',
     'prerun',

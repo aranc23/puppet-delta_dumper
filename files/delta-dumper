@@ -442,7 +442,7 @@ sub init_config {
                 'zstd'     => 'zstd --stdout',
                 'compress' => 'compress -c',
                 'none'     => 'cat',
-                'xdelta'   => 'xdelta -e',
+                'xdelta'   => 'xdelta3 -e',
             },
             ARGCOUNT => ARGCOUNT_HASH,
         },
@@ -454,7 +454,7 @@ sub init_config {
                 'zstd'     => 'zstd --uncompress --stdout',
                 'compress' => 'uncompress -c',
                 'none'     => 'cat',
-                'xdelta'   => 'xdelta -d',
+                'xdelta'   => 'xdelta3 -d',
             },
         },
         'compressor_suffix|compressor-suffix=s%' => {

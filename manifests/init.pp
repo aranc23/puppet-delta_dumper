@@ -4,7 +4,8 @@
 # exactly those from delta-dumper itself.  See the perl POD for
 # delta-dumper for details.
 #
-# A description of what this class does
+# @param packages
+#   list of packages to install
 # @param etc_dir
 #   create this directory and put a config file in it named config
 # @param user
@@ -26,6 +27,7 @@
 #   include delta_dumper
 class delta_dumper
 (
+  Array[String] $packages = ['delta-dumper'],
   Stdlib::Absolutepath $etc_dir = '/etc/delta-dumper',
   String $user = root,
   Variant[String,Integer] $group = 0,

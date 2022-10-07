@@ -9,6 +9,6 @@ class delta_dumper::service {
     owner   => root,
     group   => 0,
     mode    => '0644',
-    content => "MAILTO=${delta_dumper::user}\n${delta_dumper::cron_minute} ${delta_dumper::cron_hour} ${delta_dumper::cron_monthday} ${delta_dumper::cron_month} ${delta_dumper::cron_weekday} ${delta_dumper::user} ${delta_dumper::etc_dir}/delta-dumper\n",
+    content => "MAILTO=${delta_dumper::user}\n${delta_dumper::cron_minute} ${delta_dumper::cron_hour} ${delta_dumper::cron_monthday} ${delta_dumper::cron_month} ${delta_dumper::cron_weekday} ${delta_dumper::user} /usr/bin/delta-dumper\n",
   }
 }

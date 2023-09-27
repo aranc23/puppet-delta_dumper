@@ -1,6 +1,6 @@
 {
   "name": "aranc23-delta_dumper",
-  "version": "0.1.0",
+  "version": "0.3.10",
   "author": "Aran Cox",
   "summary": "",
   "license": "Apache-2.0",
@@ -22,12 +22,6 @@
       ]
     },
     {
-      "operatingsystem": "AlmaLinux",
-      "operatingsystemrelease": [
-        "8"
-      ]
-    },
-    {
       "operatingsystem": "Ubuntu",
       "operatingsystemrelease": [
         "20.04",
@@ -37,7 +31,7 @@
     {
       "operatingsystem": "Fedora",
       "operatingsystemrelease": [
-        "36"
+          "36","38"
       ]
     }
   ],

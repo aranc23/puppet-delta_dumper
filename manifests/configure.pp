@@ -28,7 +28,6 @@ class delta_dumper::configure {
     'log_location',
     'mysql_bindir',
     'postgresql_bindir',
-    'postgresql_dump_database',
     'postgresql_extra_option',
     'postgresql_username',
     'postgresql_host',

@@ -62,7 +62,6 @@ The following parameters are available in the `delta_dumper` class:
 * [`log_location`](#-delta_dumper--log_location)
 * [`mysql_bindir`](#-delta_dumper--mysql_bindir)
 * [`postgresql_bindir`](#-delta_dumper--postgresql_bindir)
-* [`postgresql_dump_database`](#-delta_dumper--postgresql_dump_database)
 * [`postgresql_extra_option`](#-delta_dumper--postgresql_extra_option)
 * [`postgresql_username`](#-delta_dumper--postgresql_username)
 * [`postgresql_host`](#-delta_dumper--postgresql_host)

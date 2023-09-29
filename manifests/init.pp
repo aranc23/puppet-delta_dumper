@@ -10,6 +10,8 @@
 #   create this directory and put a config file in it named config
 # @param user
 #   use this user to own the config file, and when creating cron or cron.d entries
+# @param mailto
+#   set MAILTO in the cron.d entry to this email address
 # @param group
 #   used to set group ownership of config file
 # @param cron_minute
@@ -30,6 +32,7 @@ class delta_dumper
   Array[String] $packages = ['delta-dumper'],
   Stdlib::Absolutepath $etc_dir = '/etc/delta-dumper',
   String $user = root,
+  String $mailto = root,
   Variant[String,Integer] $group = 0,
   String $cron_minute = '15',
   String $cron_hour = '1',

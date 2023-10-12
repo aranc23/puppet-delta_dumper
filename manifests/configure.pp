@@ -25,7 +25,6 @@ class delta_dumper::configure {
     'backup_location',
     'old_backup_location',
     'tmpdir',
-    'log_location',
     'mysql_bindir',
     'postgresql_bindir',
     'postgresql_extra_option',

@@ -77,7 +77,6 @@ class delta_dumper
   Optional[Stdlib::Absolutepath] $backup_location = undef,
   Optional[Array[Stdlib::Absolutepath]] $old_backup_location = undef,
   Optional[Stdlib::Absolutepath] $tmpdir = undef,
-  Optional[Stdlib::Absolutepath] $log_location = undef,
   Optional[Stdlib::Absolutepath] $mysql_bindir = undef,
   Optional[Stdlib::Absolutepath] $postgresql_bindir = undef,
   Optional[Array[String]] $postgresql_extra_option = undef,

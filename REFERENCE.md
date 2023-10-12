@@ -59,7 +59,6 @@ The following parameters are available in the `delta_dumper` class:
 * [`backup_location`](#-delta_dumper--backup_location)
 * [`old_backup_location`](#-delta_dumper--old_backup_location)
 * [`tmpdir`](#-delta_dumper--tmpdir)
-* [`log_location`](#-delta_dumper--log_location)
 * [`mysql_bindir`](#-delta_dumper--mysql_bindir)
 * [`postgresql_bindir`](#-delta_dumper--postgresql_bindir)
 * [`postgresql_extra_option`](#-delta_dumper--postgresql_extra_option)
@@ -331,14 +330,6 @@ Data type: `Optional[Array[Stdlib::Absolutepath]]`
 Default value: `undef`
 
 ##### <a name="-delta_dumper--tmpdir"></a>`tmpdir`
-
-Data type: `Optional[Stdlib::Absolutepath]`
-
-
-
-Default value: `undef`
-
-##### <a name="-delta_dumper--log_location"></a>`log_location`
 
 Data type: `Optional[Stdlib::Absolutepath]`
 

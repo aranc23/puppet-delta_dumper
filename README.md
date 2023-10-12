@@ -26,9 +26,11 @@ adds a file in /etc/cron.d/ for running delta-dumper.
 ### Setup Requirements
 
 delta-dumper defaults to writing to /var/delta-dumper/backups and
-logging to /var/log or ~/var/log for non-root users.  Changing the
-paramters backup_location and log_location does not cause this module
-(or delta-dumper itself) to create the configured directories.
+logging to /var/log/delta-dumper or ~/.local/state/delta-dumper for
+non-root users.  Changing the paramter backup_location does not cause
+this module (or delta-dumper itself) to create the configured
+directory. The log directory will however be created by delta-dumper
+if needed.
 
 ### Beginning with delta_dumper
 

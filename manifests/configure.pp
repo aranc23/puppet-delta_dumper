@@ -65,7 +65,7 @@ class delta_dumper::configure {
   file { "${delta_dumper::etc_dir}/config":
     owner   => $delta_dumper::user,
     group   => $delta_dumper::group,
-    mode    => '0500',
+    mode    => '0400',
     content => template('delta_dumper/config.erb'),
   }
 }

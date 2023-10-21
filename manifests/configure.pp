@@ -34,6 +34,7 @@ class delta_dumper::configure {
     'postgresql',
     'rsyncable',
     'rsyncable_location',
+    'rsyncable_compression',
     'sys_logging',
     'terminal_logging',
     'file_logging',

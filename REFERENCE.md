@@ -66,7 +66,6 @@ The following parameters are available in the `delta_dumper` class:
 * [`postgresql_host`](#-delta_dumper--postgresql_host)
 * [`mysql`](#-delta_dumper--mysql)
 * [`postgresql`](#-delta_dumper--postgresql)
-* [`localcow`](#-delta_dumper--localcow)
 * [`sys_logging`](#-delta_dumper--sys_logging)
 * [`terminal_logging`](#-delta_dumper--terminal_logging)
 * [`file_logging`](#-delta_dumper--file_logging)

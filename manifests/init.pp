@@ -86,6 +86,7 @@ class delta_dumper
   Optional[Boolean] $postgresql = undef,
   Optional[Boolean] $rsyncable = undef,
   Optional[Stdlib::Absolutepath] $rsyncable_location = undef,
+  Optional[String] $rsyncable_compression = undef,
   Optional[Boolean] $sys_logging = undef,
   Optional[Boolean] $terminal_logging = undef,
   Optional[Boolean] $file_logging = undef,

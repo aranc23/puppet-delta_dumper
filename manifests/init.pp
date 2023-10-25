@@ -106,7 +106,7 @@ class delta_dumper
   Optional[Integer] $month_start = undef,
   Optional[String] $maxage = undef,
   Optional[Stdlib::Absolutepath] $rsync_binary = undef,
-  Optional[Array[String]] $rsync_options = undef,
+  Optional[String] $rsync_options = undef,
   Optional[String] $prerun = undef,
   Optional[String] $postrun = undef,
   # mongodb variables:

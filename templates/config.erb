@@ -3,19 +3,25 @@
 <% @_vars.sort.each do |v|
 key="delta_dumper::#{v}" -%>
 <% if scope[key] and not scope[key].nil? and scope[key].is_a?(String) and scope[key].length > 0 -%>
-<%= v %> = <%= scope[key] %>
+<%= v %> = '<%= scope[key] %>'
 <% end -%>
 <% if scope[key] and not scope[key].nil? and scope[key].is_a?(Integer) -%>
 <%= v %> = <%= scope[key].to_s %>
 <% end -%>
 <% if scope[key] and not scope[key].nil? and scope[key].is_a?(Array)
 scope[key].each do |s| -%>
+<% if s.is_a?(String) -%>
+<%= v %> = '<%= s %>'
+<% else -%>
 <%= v %> = <%= s %>
-<% end end -%>
+<% end end end -%>
 <% if scope[key] and not scope[key].nil? and scope[key].is_a?(Hash)
 scope[key].each do |x,y| -%>
+<% if y.is_a?(String) -%>
+<%= v %> <%= x %> = '<%= y %>'
+<% else -%>
 <%= v %> <%= x %> = <%= y %>
-<% end end -%>
+<% end end end -%>
 <% if not scope[key].nil? and (scope[key].is_a?(TrueClass) || scope[key].is_a?(FalseClass)) and ( scope[key] == true or scope[key] == false ) -%>
 <%= v %> = <% if scope[key] == true %>On<% else %>Off<% end %>
 <% end -%>
